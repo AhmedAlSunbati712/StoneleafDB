@@ -208,6 +208,9 @@ void execute_transactional_command(
             transaction_manager.abort(transaction, AbortReason::DeadlockVictim);
             context.active_transaction.reset();
         }
+        // TODO this is an issue i believe if we end up implementing replication
+        // We should retry inside the engine to avoid replicating the whole transaction
+        // entry again which can cause redundancy.
         send_get_response(socket_fd, result);
         return;
     }
