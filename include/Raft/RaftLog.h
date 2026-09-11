@@ -43,6 +43,7 @@ private:
     std::string directory_;
     std::vector<std::unique_ptr<RaftSegment>> segments_;
     std::uint64_t next_index_ = 0;
+    std::uint64_t last_term_ = 0;
     std::uint64_t durable_index_ = 0;
     bool recovery_required_ = false;
     bool directory_dirty_ = false;

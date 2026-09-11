@@ -115,13 +115,24 @@ void RaftLog::open(const std::string& directory) {
             }
         }
         next_index_ = segments_.back()->next_index();
+        if (next_index_ > 1) {
+            last_term_ = 0;
+            for (auto it = segments_.rbegin(); it != segments_.rend(); ++it) {
+                if ((*it)->next_index() > (*it)->base_index()) {
+                    last_term_ = (*it)->term_at((*it)->next_index() - 1);
+                    break;
+                }
+            }
+        } else {
+            last_term_ = 0;
+        }
         durable_index_ = next_index_ - 1;
         recovery_required_ = false;
         directory_dirty_ = false;
     } catch (...) {
         segments_.clear();
         directory_.clear();
-        next_index_ = durable_index_ = 0;
+        next_index_ = last_term_ = durable_index_ = 0;
         recovery_required_ = directory_dirty_ = false;
         throw;
     }
@@ -137,7 +148,7 @@ void RaftLog::close() {
     if (directory_dirty_) disk::sync_directory(directory_);
     segments_.clear();
     directory_.clear();
-    next_index_ = durable_index_ = 0;
+    next_index_ = last_term_ = durable_index_ = 0;
     directory_dirty_ = false;
 }
 
@@ -167,6 +178,7 @@ std::uint64_t RaftLog::append(
         throw;
     }
     next_index_ += 1;
+    last_term_ = entry.term;
     return entry.idx;
 }
 
@@ -195,6 +207,7 @@ void RaftLog::append_from_leader(
             throw;
         }
         next_index_ += 1;
+        last_term_ = entry.term;
     }
 }
 
@@ -236,19 +249,8 @@ std::uint64_t RaftLog::last_index() const noexcept {
 }
 
 std::uint64_t RaftLog::last_term() const noexcept {
-    try {
-        std::shared_lock lock(mutex_);
-        if (segments_.empty() || next_index_ == 1) return 0;
-        const std::uint64_t index = next_index_ - 1;
-        for (const auto& segment : segments_) {
-            if (index >= segment->base_index() && index < segment->next_index()) {
-                return segment->term_at(index);
-            }
-        }
-        return 0;
-    } catch (...) {
-        return 0;
-    }
+    std::shared_lock lock(mutex_);
+    return last_term_;
 }
 
 std::uint64_t RaftLog::term_at(std::uint64_t index) const {
@@ -271,6 +273,18 @@ void RaftLog::truncate_suffix(std::uint64_t from_index) {
         throw std::out_of_range("Raft truncation boundary is outside the log");
     }
     if (from_index == next_index_) return;
+
+    std::uint64_t retained_last_term = 0;
+    if (from_index > 1) {
+        const std::uint64_t retained_index = from_index - 1;
+        for (const auto& segment : segments_) {
+            if (retained_index >= segment->base_index() &&
+                retained_index < segment->next_index()) {
+                retained_last_term = segment->term_at(retained_index);
+                break;
+            }
+        }
+    }
 
     std::size_t target = segments_.size();
     for (std::size_t i = 0; i < segments_.size(); ++i) {
@@ -303,6 +317,7 @@ void RaftLog::truncate_suffix(std::uint64_t from_index) {
         throw;
     }
     next_index_ = from_index;
+    last_term_ = retained_last_term;
     durable_index_ = std::min(durable_index_, from_index - 1);
 }
 

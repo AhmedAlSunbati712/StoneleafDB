@@ -74,8 +74,10 @@ TEST(RaftLogTest, TruncatesWithinSegmentAndPersistsReplacement) {
         log.sync_through(3);
         log.truncate_suffix(2);
         EXPECT_EQ(log.durable_index(), 1u);
+        EXPECT_EQ(log.last_term(), 1u);
         EXPECT_EQ(log.term_at(2), 0u);
         log.append_from_leader(2, std::vector<RaftMutationEntry>{entry(2, 2)});
+        EXPECT_EQ(log.last_term(), 2u);
         log.sync_through(2);
         EXPECT_EQ(log.durable_index(), 2u);
         log.close();
@@ -110,6 +112,25 @@ TEST(RaftLogTest, TruncatesAcrossSegmentsWithoutResurrectingTail) {
     EXPECT_EQ(reopened.term_at(1), 1u);
     EXPECT_EQ(reopened.term_at(2), 2u);
     EXPECT_EQ(reopened.scan_from(1).size(), 2u);
+}
+
+TEST(RaftLogTest, ReopensWithCrashCreatedEmptyTrailingSegment) {
+    TempDir dir;
+    {
+        RaftLog log(config());
+        log.open(dir.path.string());
+        log.append(6, {});
+        log.sync_through(1);
+        log.close();
+    }
+    std::ofstream(dir.path / "segment-00000000000000000002.store");
+    std::ofstream(dir.path / "segment-00000000000000000002.index");
+
+    RaftLog reopened(config());
+    reopened.open(dir.path.string());
+    EXPECT_EQ(reopened.last_index(), 1u);
+    EXPECT_EQ(reopened.last_term(), 6u);
+    EXPECT_EQ(reopened.append(8, {}), 2u);
 }
 
 TEST(RaftLogTest, RemovesOrphanDerivedIndexDuringOpen) {

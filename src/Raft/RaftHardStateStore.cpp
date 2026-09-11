@@ -148,6 +148,6 @@ void RaftHardStateStore::persist(
     }
 
     std::filesystem::rename(temporary, destination);
-    disk::sync_directory(directory_);
     state_ = {.term = term, .voted_for = std::move(voted_for)};
+    disk::sync_directory(directory_);
 }
