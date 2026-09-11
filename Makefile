@@ -19,6 +19,7 @@ SRC = \
 	src/client/NetCodec.cpp \
 	src/client/Session.cpp \
 	src/JournalCodec.cpp \
+	src/Raft/RaftEntryCodec.cpp \
 	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
@@ -54,6 +55,7 @@ OBJ = \
 	build/client/NetCodec.o \
 	build/client/Session.o \
 	build/JournalCodec.o \
+	build/Raft/RaftEntryCodec.o \
 	build/storage/Index.o \
 	build/Log/Segment.o \
 	build/Log/Store.o \
