@@ -89,6 +89,16 @@ TEST(StoreTest, ReadRoundTripsBinaryAndEmptyRecords) {
     EXPECT_TRUE(store.read(empty_offset).empty());
 }
 
+TEST(StoreTest, ReadPrefixReturnsOnlyRequestedPayloadBytes) {
+    TempStoreFile file;
+    Store store(file.open());
+    const std::uint64_t offset = store.append(as_bytes("abcdef"));
+
+    EXPECT_EQ(store.read_prefix(offset, 3), as_bytes("abc"));
+    EXPECT_TRUE(store.read_prefix(offset, 0).empty());
+    EXPECT_THROW(store.read_prefix(offset, 7), std::out_of_range);
+}
+
 TEST(StoreTest, ReopenPreservesExistingRecordsAndAppendsAtEnd) {
     TempStoreFile file;
     const std::vector<char> first = as_bytes("first");
@@ -176,6 +186,21 @@ TEST(StoreTest, RepairTailTruncatesToValidBoundaryAndAllowsAppend) {
     EXPECT_EQ(repaired.record_count, 1u);
     EXPECT_EQ(store.append(as_bytes("z")), 5u);
     EXPECT_EQ(store.read(5), as_bytes("z"));
+}
+
+TEST(StoreTest, TruncateToRetainsCompletePrefixAndAllowsAppend) {
+    TempStoreFile file;
+    Store store(file.open());
+    store.append(as_bytes("one"));
+    store.append(as_bytes("two"));
+    store.append(as_bytes("three"));
+
+    store.truncate_to(1);
+
+    EXPECT_EQ(store.scan().record_count, 1u);
+    EXPECT_EQ(store.read(0), as_bytes("one"));
+    EXPECT_EQ(store.append(as_bytes("replacement")), 7u);
+    EXPECT_THROW(store.truncate_to(3), std::out_of_range);
 }
 
 TEST(StoreTest, ReadRejectsOffsetsOutsideCompleteRecordRegion) {
