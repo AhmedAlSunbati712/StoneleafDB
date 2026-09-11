@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <DiskIO.h>
-#include <Log/Index.h>
 #include <Log/Segment.h>
 #include <Log/Store.h>
 #include <Log/WalRecordCodec.h>
+#include <storage/Index.h>
 
 #include <chrono>
 #include <cstdint>
@@ -81,8 +81,8 @@ void write_index_entries(
     const TempSegmentFiles &files,
     const std::vector<std::pair<std::uint32_t, std::uint64_t>> &entries) {
     Index index(files.open_index());
-    for (const auto &[relative_lsn, store_offset] : entries) {
-        index.append(relative_lsn, store_offset);
+    for (const auto &[ordinal, store_offset] : entries) {
+        index.append(ordinal, store_offset);
     }
 }
 

@@ -116,6 +116,30 @@ std::vector<char> Store::read(std::uint64_t offset) const {
     return record;
 }
 
+std::vector<char> Store::read_prefix(std::uint64_t offset, std::size_t count) const {
+    std::shared_lock lock(mutex_);
+
+    if (offset >= scan_result_.valid_size ||
+        scan_result_.valid_size - offset < RECORD_LENGTH_SIZE) {
+        throw std::out_of_range("Store record offset is outside the valid record region");
+    }
+
+    std::array<char, RECORD_LENGTH_SIZE> length_bytes{};
+    disk::read_exact_at(fd_, length_bytes, static_cast<std::streamoff>(offset));
+    const std::uint64_t record_size = get_u32_be(length_bytes.data());
+    const std::uint64_t payload_offset = offset + RECORD_LENGTH_SIZE;
+    if (record_size > scan_result_.valid_size - payload_offset) {
+        throw std::runtime_error("Store record extends beyond the valid record region");
+    }
+    if (count > record_size) {
+        throw std::out_of_range("Store prefix exceeds the record payload");
+    }
+
+    std::vector<char> prefix(count);
+    disk::read_exact_at(fd_, prefix, static_cast<std::streamoff>(payload_offset));
+    return prefix;
+}
+
 StoreScanResult Store::scan() const {
     std::shared_lock lock(mutex_);
     return scan_result_;
@@ -134,6 +158,27 @@ void Store::repair_tail() {
     size_ = scan_result_.valid_size;
     scan_result_.status = StoreScanStatus::Complete;
     scan_result_.physical_size = size_;
+}
+
+void Store::truncate_to(std::uint64_t record_count) {
+    std::unique_lock lock(mutex_);
+    if (record_count > scan_result_.record_count) {
+        throw std::out_of_range("Cannot retain more Store records than the valid prefix");
+    }
+
+    std::uint64_t offset = 0;
+    for (std::uint64_t ordinal = 0; ordinal < record_count; ++ordinal) {
+        std::array<char, RECORD_LENGTH_SIZE> length_bytes{};
+        disk::read_exact_at(fd_, length_bytes, static_cast<std::streamoff>(offset));
+        offset += RECORD_LENGTH_SIZE + get_u32_be(length_bytes.data());
+    }
+
+    disk::truncate_file(fd_, static_cast<std::streamoff>(offset));
+    size_ = offset;
+    scan_result_.status = StoreScanStatus::Complete;
+    scan_result_.physical_size = offset;
+    scan_result_.valid_size = offset;
+    scan_result_.record_count = record_count;
 }
 
 void Store::sync() {

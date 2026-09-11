@@ -79,6 +79,12 @@ class Store {
         /// is outside the framing-valid region or the read fails.
         std::vector<char> read(std::uint64_t offset) const;
 
+        /// Reads the first `count` bytes of a complete record payload.
+        ///
+        /// This avoids decoding or copying a variable-length payload when a
+        /// caller needs fixed-position metadata such as a Raft entry term.
+        std::vector<char> read_prefix(std::uint64_t offset, std::size_t count) const;
+
         /// Returns the current framing inspection result.
         StoreScanResult scan() const;
 
@@ -88,6 +94,12 @@ class Store {
         /// synchronized automatically; call `sync()` if recovery requires the
         /// repair to be durable before proceeding.
         void repair_tail();
+
+        /// Retains exactly `record_count` complete records from the front.
+        ///
+        /// The requested count must not exceed the framing-valid prefix. The
+        /// truncation is not synchronized automatically.
+        void truncate_to(std::uint64_t record_count);
 
         /// Synchronizes all current store bytes to the required storage layer.
         void sync();

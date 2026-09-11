@@ -1,4 +1,4 @@
-#include <Log/Index.h>
+#include <storage/Index.h>
 
 #include <DiskIO.h>
 #include <Endian.h>
@@ -10,8 +10,8 @@
 
 namespace {
 
-constexpr std::size_t RELATIVE_LSN_OFFSET = 0;
-constexpr std::size_t STORE_OFFSET_OFFSET = Index::RELATIVE_LSN_SIZE;
+constexpr std::size_t ORDINAL_OFFSET = 0;
+constexpr std::size_t STORE_OFFSET_OFFSET = Index::ORDINAL_SIZE;
 
 } // namespace
 
@@ -45,7 +45,7 @@ Index::~Index() noexcept {
     fd_ = -1;
 }
 
-void Index::append(std::uint32_t relative_lsn, std::uint64_t store_offset) {
+void Index::append(std::uint32_t ordinal, std::uint64_t store_offset) {
     std::unique_lock lock(mutex_);
 
     if (scan_result_.status != IndexScanStatus::Complete) {
@@ -54,7 +54,7 @@ void Index::append(std::uint32_t relative_lsn, std::uint64_t store_offset) {
 
     const std::uint64_t entry_offset = size_;
     std::array<char, ENTRY_SIZE> entry{};
-    put_u32_be(entry.data() + RELATIVE_LSN_OFFSET, relative_lsn);
+    put_u32_be(entry.data() + ORDINAL_OFFSET, ordinal);
     put_u64_be(entry.data() + STORE_OFFSET_OFFSET, store_offset);
 
     try {
@@ -88,20 +88,20 @@ void Index::append(std::uint32_t relative_lsn, std::uint64_t store_offset) {
     scan_result_.entry_count += 1;
 }
 
-std::uint64_t Index::read(std::uint32_t relative_lsn) const {
+std::uint64_t Index::read(std::uint32_t ordinal) const {
     std::shared_lock lock(mutex_);
 
-    if (relative_lsn >= scan_result_.entry_count) {
-        throw std::out_of_range("Index relative LSN is outside the valid entry range");
+    if (ordinal >= scan_result_.entry_count) {
+        throw std::out_of_range("Index ordinal is outside the valid entry range");
     }
 
-    const std::uint64_t entry_offset = static_cast<std::uint64_t>(relative_lsn) * ENTRY_SIZE;
+    const std::uint64_t entry_offset = static_cast<std::uint64_t>(ordinal) * ENTRY_SIZE;
     std::array<char, ENTRY_SIZE> entry{};
     disk::read_exact_at(fd_, entry, static_cast<std::streamoff>(entry_offset));
 
-    const std::uint32_t stored_relative_lsn = get_u32_be(entry.data() + RELATIVE_LSN_OFFSET);
-    if (stored_relative_lsn != relative_lsn) {
-        throw std::runtime_error("Index entry contains an unexpected relative LSN");
+    const std::uint32_t stored_ordinal = get_u32_be(entry.data() + ORDINAL_OFFSET);
+    if (stored_ordinal != ordinal) {
+        throw std::runtime_error("Index entry contains an unexpected ordinal");
     }
 
     return get_u64_be(entry.data() + STORE_OFFSET_OFFSET);
@@ -167,9 +167,9 @@ IndexScanResult Index::inspect_file() const {
             entry,
             static_cast<std::streamoff>(entry_offset));
 
-        const std::uint32_t stored_relative_lsn =
-            get_u32_be(entry.data() + RELATIVE_LSN_OFFSET);
-        if (stored_relative_lsn != ordinal) {
+        const std::uint32_t stored_ordinal =
+            get_u32_be(entry.data() + ORDINAL_OFFSET);
+        if (stored_ordinal != ordinal) {
             result.status = IndexScanStatus::Corrupt;
             result.valid_size = entry_offset;
             result.entry_count = ordinal;

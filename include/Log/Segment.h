@@ -1,9 +1,9 @@
 #pragma once
 
 #include <Log/Config.h>
-#include <Log/Index.h>
 #include <Log/Store.h>
 #include <Log/WalRecord.h>
+#include <storage/Index.h>
 
 #include <cstdint>
 #include <shared_mutex>

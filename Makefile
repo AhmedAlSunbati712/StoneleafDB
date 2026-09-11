@@ -19,7 +19,11 @@ SRC = \
 	src/client/NetCodec.cpp \
 	src/client/Session.cpp \
 	src/JournalCodec.cpp \
-	src/Log/Index.cpp \
+	src/Raft/RaftEntryCodec.cpp \
+	src/Raft/RaftHardStateStore.cpp \
+	src/Raft/RaftSegment.cpp \
+	src/Raft/RaftLog.cpp \
+	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
 	src/Log/WalRecordCodec.cpp \
@@ -54,7 +58,11 @@ OBJ = \
 	build/client/NetCodec.o \
 	build/client/Session.o \
 	build/JournalCodec.o \
-	build/Log/Index.o \
+	build/Raft/RaftEntryCodec.o \
+	build/Raft/RaftHardStateStore.o \
+	build/Raft/RaftSegment.o \
+	build/Raft/RaftLog.o \
+	build/storage/Index.o \
 	build/Log/Segment.o \
 	build/Log/Store.o \
 	build/Log/WalRecordCodec.o \
@@ -164,6 +172,8 @@ build/tests/unit/BTreeOperation_test: CXXFLAGS += -pthread
 build/tests/unit/BTreeOperation_test: LDLIBS += -pthread
 build/tests/unit/Log_test: CXXFLAGS += -pthread
 build/tests/unit/Log_test: LDLIBS += -pthread
+build/tests/unit/RaftLog_test: CXXFLAGS += -pthread
+build/tests/unit/RaftLog_test: LDLIBS += -pthread
 build/tests/unit/TransactionManager_test: CXXFLAGS += -pthread
 build/tests/unit/TransactionManager_test: LDLIBS += -pthread
 build/tests/unit/WaitForGraph_test: CXXFLAGS += -pthread
