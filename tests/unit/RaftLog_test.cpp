@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <thread>
 
 namespace {
 
@@ -157,6 +158,28 @@ TEST(RaftLogTest, ValidatesPublicBoundaries) {
     EXPECT_THROW(log.truncate_suffix(0), std::out_of_range);
     EXPECT_THROW(log.sync_through(1), std::out_of_range);
     EXPECT_NO_THROW(log.truncate_suffix(1));
+}
+
+TEST(RaftLogTest, ConcurrentAppendsRemainUniqueAndDense) {
+    TempDir dir;
+    RaftLog log(config());
+    log.open(dir.path.string());
+    constexpr int thread_count = 6;
+    constexpr int entries_per_thread = 20;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&log] {
+            for (int j = 0; j < entries_per_thread; ++j) log.append(9, {});
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    const auto entries = log.scan_from(1);
+    ASSERT_EQ(entries.size(), thread_count * entries_per_thread);
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        EXPECT_EQ(entries[i].idx, i + 1);
+        EXPECT_EQ(entries[i].term, 9u);
+    }
 }
 
 } // namespace
