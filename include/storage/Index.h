@@ -4,17 +4,17 @@
 #include <cstdint>
 #include <shared_mutex>
 
-/// Result of inspecting the fixed-width entries in a WAL index file.
+/// Result of inspecting the fixed-width entries in a record index file.
 enum class IndexScanStatus : std::uint8_t {
     Complete = 0,
     IncompleteTail,
     Corrupt,
 };
 
-/// Describes the valid prefix of a WAL index file.
+/// Describes the valid prefix of a record index file.
 ///
 /// `valid_size` stops before an incomplete final entry or the first entry whose
-/// encoded relative LSN does not match its ordinal position. The Store remains
+/// encoded ordinal does not match its positional entry. The Store remains
 /// authoritative; Segment later validates that indexed offsets identify real
 /// Store records and rebuilds an invalid Index from those records.
 struct IndexScanResult {
@@ -24,33 +24,33 @@ struct IndexScanResult {
     std::uint64_t entry_count = 0;
 };
 
-/// Owns the fixed-width index file for one WAL segment.
+/// Owns a fixed-width index file for a segmented record store.
 ///
-/// Entries are dense and begin at relative LSN zero:
+/// Entries are dense and begin at ordinal zero:
 ///
 /// ```text
 /// +--------------------------+--------------------------+
-/// | relative LSN (4 bytes)   | Store offset (8 bytes)   |
+/// | ordinal (4 bytes)        | Store offset (8 bytes)   |
 /// | unsigned, big-endian     | unsigned, big-endian     |
 /// +--------------------------+--------------------------+
 /// ```
 ///
 /// Because entries have a fixed width, lookup is a positional read at
-/// `relative_lsn * ENTRY_SIZE`. The constructor takes ownership of `fd` and
+/// `ordinal * ENTRY_SIZE`. The constructor takes ownership of `fd` and
 /// inspects existing entries. A partial final entry blocks append until
 /// `repair_tail()` truncates it. A corrupt complete entry requires a later
 /// rebuild from the authoritative Store and cannot be repaired here.
 ///
 /// Reads may run concurrently. Append, repair, and synchronization are
 /// serialized. Segment owns the dense-sequence invariant; this lower-level
-/// file layer encodes the relative LSN supplied by its caller. Append does not
+/// file layer encodes the ordinal supplied by its caller. Append does not
 /// make an entry crash-durable; the caller uses `sync()` at the appropriate
-/// WAL durability boundary.
+/// caller's durability boundary.
 class Index {
     public:
-        static constexpr std::size_t RELATIVE_LSN_SIZE = sizeof(std::uint32_t);
+        static constexpr std::size_t ORDINAL_SIZE = sizeof(std::uint32_t);
         static constexpr std::size_t STORE_OFFSET_SIZE = sizeof(std::uint64_t);
-        static constexpr std::size_t ENTRY_SIZE = RELATIVE_LSN_SIZE + STORE_OFFSET_SIZE;
+        static constexpr std::size_t ENTRY_SIZE = ORDINAL_SIZE + STORE_OFFSET_SIZE;
 
         /// Takes ownership of an open, writable index file descriptor.
         explicit Index(int fd);
@@ -61,18 +61,18 @@ class Index {
         Index(Index &&) = delete;
         Index &operator=(Index &&) = delete;
 
-        /// Appends a relative-LSN-to-Store-offset mapping.
+        /// Appends an ordinal-to-Store-offset mapping.
         ///
-        /// Segment must supply the current entry ordinal as `relative_lsn`.
+        /// Segment must supply the current entry ordinal.
         /// Throws when the Index has an incomplete or corrupt tail or an I/O
         /// operation fails.
-        void append(std::uint32_t relative_lsn, std::uint64_t store_offset);
+        void append(std::uint32_t ordinal, std::uint64_t store_offset);
 
-        /// Returns the Store offset mapped by `relative_lsn`.
+        /// Returns the Store offset mapped by `ordinal`.
         ///
-        /// Throws when the relative LSN is outside the valid entry prefix, the
-        /// stored entry does not match the requested LSN, or an I/O fails.
-        std::uint64_t read(std::uint32_t relative_lsn) const;
+        /// Throws when the ordinal is outside the valid entry prefix, the
+        /// stored entry does not match the requested ordinal, or an I/O fails.
+        std::uint64_t read(std::uint32_t ordinal) const;
 
         /// Returns the current fixed-width entry inspection result.
         IndexScanResult scan() const;

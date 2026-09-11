@@ -3,7 +3,7 @@
 #include <DiskIO.h>
 #include <Endian.h>
 #include <Log/Config.h>
-#include <Log/Index.h>
+#include <storage/Index.h>
 
 #include <cerrno>
 #include <chrono>
@@ -52,10 +52,10 @@ class TempIndexFile {
         std::filesystem::path path;
 };
 
-std::vector<char> entry_bytes(std::uint32_t relative_lsn, std::uint64_t store_offset) {
+std::vector<char> entry_bytes(std::uint32_t ordinal, std::uint64_t store_offset) {
     std::vector<char> entry(Index::ENTRY_SIZE);
-    put_u32_be(entry.data(), relative_lsn);
-    put_u64_be(entry.data() + Index::RELATIVE_LSN_SIZE, store_offset);
+    put_u32_be(entry.data(), ordinal);
+    put_u64_be(entry.data() + Index::ORDINAL_SIZE, store_offset);
     return entry;
 }
 

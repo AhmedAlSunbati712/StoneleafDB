@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Log/Index.h>
+#include <storage/Index.h>
 
 #include <cstdint>
 #include <stdexcept>
