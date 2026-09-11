@@ -95,20 +95,13 @@ before writing production code.
 
 The handoff is a completion requirement, not an optional documentation step.
 An agent MUST NOT claim that a task is complete or send its final response
-until both steps below have been performed.
-
-1. Re-read the affected parts of `design-review.md`. If the task changed an
-   architectural decision, invariant, interface, binary format, recovery rule,
-   concurrency rule, or implementation sequence, update `design-review.md` in
-   the same task. Do not leave it describing behavior that the repository no
-   longer implements or intends to implement.
-2. Post the handoff comment on the task's Linear ticket, in the shape given in
-   `.claude/skills/feature-workflow/SKILL.md` (step 6): what landed, the
-   validation performed and its result, what changed in `design-review.md` or
-   why nothing needed to change, and any open questions or follow-ups.
+until it has posted the handoff comment on the task's Linear ticket, in the
+shape given in `.claude/skills/feature-workflow/SKILL.md` (step 6): what
+landed, the validation performed and its result, what changed in `Docs/` or
+why nothing needed to change, and any open questions or follow-ups.
 
 The Linear ticket is the handoff record. `STATUS.md` is no longer used for
 handoff entries.
 
-If `design-review.md` cannot be updated, or Linear is unreachable, the task is
-not complete: report the handoff as a blocker instead of claiming completion.
+If Linear is unreachable, the task is not complete: report the handoff as a
+blocker instead of claiming completion.

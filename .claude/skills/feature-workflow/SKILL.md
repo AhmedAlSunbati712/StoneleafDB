@@ -166,7 +166,7 @@ Post one comment with `save_comment(issueId: "STO-14", body: ...)`:
 - `make test-integration` — <result>
 
 **Design contracts**
-- <what changed in Docs/ or design-review.md, or "no design contract changed">
+- <what changed in Docs/, or "no design contract changed">
 
 **Open questions / follow-ups**
 - <anything the reviewer must decide, or "none">
@@ -185,14 +185,9 @@ After merge: move the ticket to **Done**, then `git switch main && git pull
 
 ## Handoff obligations
 
-Before claiming a task is complete, both must be true:
-
-1. **`design-review.md` reflects reality.** If the task changed an
-   architectural decision, invariant, interface, binary format, recovery rule,
-   concurrency rule, or implementation sequence, update `design-review.md` in
-   the same task. See `AGENTS.md`.
-2. **The Linear ticket carries the step-6 comment.** This replaced the old
-   `STATUS.md` handoff entry; do not write handoff entries to `STATUS.md`.
+Before claiming a task is complete, **the Linear ticket must carry the step-6
+comment.** This replaced the old `STATUS.md` handoff entry; do not write
+handoff entries to `STATUS.md`.
 
 If Linear is unreachable, say so explicitly in your final response and put the
 handoff comment content in the PR body instead. Do not silently drop it.

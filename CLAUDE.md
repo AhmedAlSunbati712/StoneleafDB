@@ -33,5 +33,4 @@ Questions, reads, and exploration do not need the workflow. Writing code does.
 
 - `make all && make test-unit && make test-integration` pass, or you state
   plainly which failed and why.
-- `design-review.md` matches what the repo now does (see AGENTS.md).
 - The Linear ticket has the handoff comment.
