@@ -20,6 +20,7 @@ SRC = \
 	src/client/Session.cpp \
 	src/JournalCodec.cpp \
 	src/Raft/RaftEntryCodec.cpp \
+	src/Raft/RaftHardStateStore.cpp \
 	src/Raft/RaftSegment.cpp \
 	src/Raft/RaftLog.cpp \
 	src/storage/Index.cpp \
@@ -58,6 +59,7 @@ OBJ = \
 	build/client/Session.o \
 	build/JournalCodec.o \
 	build/Raft/RaftEntryCodec.o \
+	build/Raft/RaftHardStateStore.o \
 	build/Raft/RaftSegment.o \
 	build/Raft/RaftLog.o \
 	build/storage/Index.o \
