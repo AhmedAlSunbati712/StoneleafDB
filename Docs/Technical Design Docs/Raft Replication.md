@@ -103,7 +103,7 @@ Do we think this abstraction is worth it or not? I believe it is honestly. It ju
 Let's implement the retries and the reconnections on the client module. When we initialize the client, we just need to pass it the `node_addr[]` array and thats it. Ok, let's forget about this then.
 
 ## Coupling Raft Replication with the storage process
-Which is the only way either way. The client will have a list of node addresses when connecting to the database. It will have the states `leader_addr` and `node_addr[]`. On the first request, it's going to mak a random connection to any of the nodes, set that address as the leader. If they reply with a different address, it will set that as the leader address and retry. On Every call, the client will set a timouet. When the timeout expires, it connects to a random node until it finds the new leader. If none of those work after a configurable number of tries, the cluster is down.
+Which is the only way either way. The client will have a list of the nodes' client addresses (the `client_addr` column of the cluster config, never the Raft addresses) when connecting to the database. It will have the states `leader_addr` and `node_addr[]`. On the first request, it's going to mak a random connection to any of the nodes, set that address as the leader. If they reply with a different address, it will set that as the leader address and retry. On Every call, the client will set a timouet. When the timeout expires, it connects to a random node until it finds the new leader. If none of those work after a configurable number of tries, the cluster is down.
 In terms of network connections, we will reuse the same model from before where a single session kicks off it's own thread.
 ### Client Messages
 The client will send commands to the servers. Each message will be the command type and then the command payload which is just an array of bytes.
@@ -275,7 +275,7 @@ if the command is a commit or an implicit transaction command:
     lock(state_mutex)
     if state != Leader:                              // deposed mid-transaction
         unlock; release locks; clear buffer
-        return {Failed, leader_address}
+        return {Failed, leader_client_address()}     // client address, not the Raft one
     operations  <- write_buffer.to_operations()
     my_term     <- current_term
     idx         <- RaftLog.append(my_term, operations)
@@ -291,7 +291,9 @@ return to the user
 ```
 
 ### Checking leadership
-A session that arrives at a follower is rejected at accept time, before a handler thread is spawned: the acceptor reads `state` and `leader_address` under `state_mutex` and replies with `{Failed, leader_address}` immediately. That keeps a follower from paying for a thread and a parse just to say "not me."
+A session that arrives at a follower is rejected at accept time, before a handler thread is spawned: the acceptor reads `state` and `leader_address` under `state_mutex` and replies with `{Failed, leader_client_address()}` immediately. That keeps a follower from paying for a thread and a parse just to say "not me."
+
+The redirect must carry the leader's **client** address. `leader_address` is learned from `AppendEntries`, so it is the leader's Raft (gRPC) address; a client sent there would reach the gRPC port and fail the protocol. `leader_client_address()` translates it through `client_addr_of` (see *Raft State*).
 
 That check is a fast path, not the correctness-critical one. **Leadership can change mid-session** — a transaction may open while we are leader, buffer writes for seconds, and reach `COMMIT` after we have been deposed. So the propose path re-checks, and the re-check must be atomic with the append: verifying leadership, reading `current_term`, and appending happen under a single hold of `state_mutex`. Split them and a deposed server stamps an entry with a stale term, which a new leader then truncates while the session waits on an index that will never apply.
 
@@ -696,8 +698,16 @@ Three invariants are enforced through the method surface rather than left to cal
 2. **Leader-only state is per-leadership, not per-process.** `send_next` and `replicated_index` are reinitialized by `become_leader()` on every election win. Initializing them once in the constructor leaves a re-elected leader reusing stale progress from its previous term.
 3. **The cluster config is the only source of address spellings.** Address-as-identity means every comparison and every hash is a string comparison, so a node that spells itself two ways is two nodes. Rather than normalizing or resolving at runtime, the spellings are fixed once and never derived:
 
-   - One cluster config listing every node as `host:port`, **byte-identical on all nodes**.
-   - Each node is launched with a `--self` address that must match one entry **exactly**. `RaftState`'s constructor takes the full list plus that self address, asserts membership, and partitions the list into `node_address` and `node_addresses`. A mismatch is a startup failure, not a runtime surprise.
+   - One cluster config, **byte-identical on all nodes**, listing every node as a pair: its Raft (gRPC) address and its client address. They are different ports, so they are different strings:
+
+     ```text
+     # raft_addr       client_addr
+     10.0.0.1:5001     10.0.0.1:6001
+     10.0.0.2:5001     10.0.0.2:6001
+     10.0.0.3:5001     10.0.0.3:6001
+     ```
+   - Each node is launched with `--self` set to its own **client** address, which must match exactly one row's `client_addr`. That row's `raft_addr` becomes `node_address`. `RaftState`'s constructor takes the full list plus that self address, asserts membership, partitions the Raft addresses into `node_address` and `node_addresses`, and builds `client_addr_of`. A mismatch is a startup failure, not a runtime surprise.
+   - **The Raft address is the node's identity**: `voted_for`, the `send_next` / `replicated_index` keys, the RPC sender field, and the vote file all use it. The client address is never compared or hashed; its only use is being handed to a client in a redirect, via `client_addr_of`.
    - Every RPC carries the sender's own configured address, copied verbatim from that file.
    - **Addresses are never derived from a socket.** `getpeername()` is not used for identity anywhere. It returns `127.0.0.1:5001` on one connection and `localhost:5001` or `::ffff:127.0.0.1:5001` on another; those hash differently, so `voted_for == candidate` fails and the server grants a second vote in a term it has already voted in — two leaders, arriving through string comparison.
 
@@ -729,6 +739,12 @@ struct std::hash<NodeAddress> {
     }
 };
 
+// One row of the cluster config.
+struct ClusterMember {
+    NodeAddress raft;     // gRPC address; the node's identity
+    NodeAddress client;   // where database clients connect; only ever handed to clients
+};
+
 enum class State : std::uint8_t {
     Leader = 0,
     Follower,
@@ -736,12 +752,14 @@ enum class State : std::uint8_t {
 };
 class RaftState {
     public:
-        // cluster_addresses is the full config list including ourselves;
-        // self must match one of its entries exactly or construction fails.
-        // The list is partitioned into node_address and node_addresses.
+        // cluster is the full config list including ourselves; self_client
+        // must match exactly one entry's client address or construction
+        // fails. That entry's raft address becomes node_address, the other
+        // raft addresses become node_addresses, and every row populates
+        // client_addr_of.
         RaftState(State state,
-                  std::vector<NodeAddress> cluster_addresses,
-                  NodeAddress self,
+                  std::vector<ClusterMember> cluster,
+                  NodeAddress self_client,
                   std::uint64_t last_raft_index,
                   std::uint64_t last_raft_term,
                   std::uint64_t last_applied);
@@ -770,6 +788,13 @@ class RaftState {
         void become_leader(std::uint64_t last_log_index);
         void become_follower(std::uint64_t new_term, std::optional<NodeAddress> leader);
 
+        // --- Client redirects ----------------------------------------------
+        // The leader's CLIENT address, for NotLeader redirects:
+        // client_addr_of.at(*leader_address), or nullopt when leader_address
+        // is nullopt. Never hand leader_address itself to a client - it is
+        // a Raft address.
+        std::optional<NodeAddress> leader_client_address() const;
+
         // --- Election timing -------------------------------------------------
         // Redraws election_deadline from the randomized range. become_candidate()
         // and become_follower() call it internally, so the only explicit callers
@@ -783,7 +808,7 @@ class RaftState {
 
     private:
         State state;
-        std::size_t cluster_size; // len(cluster_addresses), i.e. peers + ourselves
+        std::size_t cluster_size; // len(cluster), i.e. peers + ourselves
 
         // Persistent: both must be fsynced before any RPC reply that depended
         // on them leaves this server. Kept outside the Raft log, which has
@@ -805,13 +830,17 @@ class RaftState {
         std::uint64_t commit_index;
         std::uint64_t last_applied;
 
-        std::vector<NodeAddress> node_addresses; // every peer, self excluded
-        NodeAddress node_address;                // our own address
+        std::vector<NodeAddress> node_addresses; // every peer's raft address, self excluded
+        NodeAddress node_address;                // our own raft address
 
-        // Who we currently believe the leader is. Followers learn it from
-        // AppendEntries; it is what a follower hands back when it rejects a
-        // client with NotLeader, so the client knows where to go next.
-        // nullopt while we have not heard from a leader this term.
+        // raft address -> client address, for every node including ourselves.
+        // Built once from the cluster config; never modified.
+        std::unordered_map<NodeAddress, NodeAddress> client_addr_of;
+
+        // Raft address of who we currently believe the leader is. Followers
+        // learn it from AppendEntries. Clients are redirected to
+        // leader_client_address(), never to this. nullopt while we have not
+        // heard from a leader this term.
         std::optional<NodeAddress> leader_address;
 
         // --- Synchronization -------------------------------------------------
@@ -1107,4 +1136,4 @@ Threads differ in how they treat errors, and the difference is deliberate:
 - **Session threads absorb their own errors.** A client disconnecting mid-transaction aborts it and releases its locks, as `serve_connection` already does today.
 
 ## Gaps not Filled yet
-- **Commit Status wire encoding**: `CommitResult { Success, Failed, Unknown }` and where each value is produced are now designed under *Returning the commit result*. What remains is purely the wire format: how the three values plus an optional `leader_address` redirect are encoded in the client response, alongside the existing size-prefixed command protocol.
+- **Commit Status wire encoding**: `CommitResult { Success, Failed, Unknown }` and where each value is produced are now designed under *Returning the commit result*. What remains is purely the wire format: how the three values plus an optional redirect to the leader's client address (`leader_client_address()`, never the Raft `leader_address`) are encoded in the client response, alongside the existing size-prefixed command protocol.
