@@ -584,12 +584,10 @@ Completion criteria:
 
 ## Step 7: Add One Raft Group
 
-Raft entries contain versioned logical batches:
+Raft entries contain operations-only logical batches:
 
 ```text
 WriteBatch {
-    client_id
-    request_id
     Put(...)
     Delete(...)
 }
@@ -604,15 +602,16 @@ Implement:
 - Logical command encoding.
 - Ordered local application.
 - Atomic persistence of data and `last_applied_raft_index`.
-- Client request deduplication.
 - Leader-only ReadIndex reads.
 
 Completion criteria:
 
 - A three-node group preserves acknowledged writes after one node fails.
-- A retried request is applied once.
 - Every healthy replica has identical logical key-value contents.
 - A node crashing midway through local apply recovers and reapplies safely.
+
+Client request deduplication is deferred. Adding it requires an explicit Raft
+entry-format migration beyond the operations-only format.
 
 ## Step 8: Add Snapshots and Hardening
 

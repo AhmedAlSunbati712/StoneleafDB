@@ -874,68 +874,45 @@ replicates a separate logical log.
 StoneleafDB initially exposes leader-only `Get`, `Scan`, and atomic
 `WriteBatch`. Interactive distributed transactions are deferred.
 
-The Raft library owns each entry's term and index. The state-machine payload has
-this 40-byte header:
-
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 4 | Command magic |
-| 4 | 2 | Command version (`1`) |
-| 6 | 2 | Flags |
-| 8 | 8 | Client ID |
-| 16 | 8 | Request ID |
-| 24 | 4 | Operation count |
-| 28 | 4 | Exact operation bytes |
-| 32 | 4 | CRC32C |
-| 36 | 4 | Reserved |
-
-Each operation begins with:
+The Raft entry stores its term and dense index followed directly by an
+operations-only logical batch. Each operation begins with:
 
 ```text
-u8 operation_type       // 1 = Put, 2 = Delete
-u8 reserved
-u16 operation_flags
-u32 encoded_key_bytes
-u32 encoded_value_bytes // zero for Delete
-byte key[encoded_key_bytes]
-byte value[encoded_value_bytes]
+u8 operation_type       // 0 = Put, 1 = Delete
+u8 key_type
+u32 key_size
+byte key[key_size]
+// Put only:
+u8 value_type
+u32 value_size
+byte value[value_size]
 ```
 
 Keys and values use the existing canonical StoneleafDB type-tagged codecs.
-Decoding validates operation counts, lengths, key/value formats, trailing
-bytes, and CRC before application. Unknown required flags or operations reject
-the entry and mark the node unhealthy; a committed command must never be
-silently skipped.
-
-Client and request IDs provide exactly-once *application* over an at-least-once
-network. An internal deduplication B+ tree stores the latest request and result
-for each client. The apply transaction changes user keys, the deduplication
-entry, and page zero's applied Raft position atomically.
-
-The first client protocol permits one outstanding write per client ID and uses
-monotonically increasing request IDs. A request matching the stored ID returns
-the stored result, a lower ID is rejected as stale, and a higher ID is proposed
-normally. Supporting several concurrent requests from one client would require
-a bounded result history and is deferred.
+Decoding validates operation counts, lengths, logical types, key/value formats,
+and trailing bytes before application. A committed command must never be
+silently skipped. Client request deduplication is deferred and will require an
+explicitly designed entry-format migration.
 
 ## Raft Write and Apply Path
 
 ```text
 client WriteBatch
-    -> leader validates and checks request cache
+    -> leader validates the logical mutations
     -> leader appends logical command to Raft
     -> command reaches durable majority
     -> Raft marks entry committed
     -> each node's apply thread receives entries in index order
     -> local ARIES transaction applies the batch
-    -> applied index and dedup result commit atomically
-    -> leader returns the stored result
+    -> applied index commits atomically with the mutations
+    -> leader returns the command result
 ```
 
 The leader replies only after both quorum commitment and local application.
 This simplifies result delivery and guarantees that a successful response can
-be served by the leader's current state. If the response is lost, the client
-retries the same `(client_id, request_id)` and receives the persisted result.
+be served by the leader's current state. Without request deduplication, a lost
+response remains an unknown result and is not automatically retried as a new
+write.
 
 Initially, every node synchronizes its local commit WAL even though the logical
 command is already durable in the Raft log. This double logging is accepted for
@@ -1064,7 +1041,7 @@ back writes.
 
 - Replicate logical write batches, persist Raft state, and apply through one
   ordered thread.
-- Persist the applied index and deduplication result in each local transaction.
+- Persist the applied index in each local transaction.
 - Add leader-only ReadIndex reads and retry-safe client responses.
 
 Acceptance: three nodes retain acknowledged writes through any single-node

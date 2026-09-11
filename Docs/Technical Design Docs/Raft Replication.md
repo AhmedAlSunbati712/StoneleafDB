@@ -428,6 +428,32 @@ Segments pay off again later: log compaction is deleting whole segments from the
 ### Entry format
 The in-memory entry is the `RaftMutationEntry` already defined above, `{term, idx, operations}`. An **empty `operations` vector is a no-op entry**: it replicates and commits normally but applies nothing, which is the mechanism read handling will use to confirm `last_applied` is current. The Store payload encodes `{term, index, operations}`, with `term` and `index` first at fixed offsets and the variable-length operations after. The index is redundant with the entry's position and is stored anyway so the decoder can validate it, matching how the WAL validates the LSN carried in each record payload.
 
+All integers are unsigned big-endian. The payload is operations-only and has
+no command envelope, checksum, client ID, or request ID:
+
+```text
+u64 term
+u64 index
+u32 operation_count
+
+repeated operation_count times:
+    u8 mutation_type       // 0 = Put, 1 = Delete
+    u8 key_type
+    u32 key_size
+    byte key[key_size]
+    if mutation_type == Put:
+        u8 value_type
+        u32 value_size
+        byte value[value_size]
+```
+
+Keys and values use their existing canonical encoded representations. The
+decoder rejects zero terms and indexes, unknown mutation or logical types,
+invalid key/value representations, impossible counts, truncated fields, and
+trailing bytes. Request deduplication is deferred; adding it would require an
+explicitly designed entry-format migration rather than silently changing this
+layout.
+
 ### Interface
 ```c++
 class RaftLog {
@@ -495,6 +521,12 @@ These are Raft's other durable state and they do not belong in either log — th
 ```text
 term (8, BE) | has_vote (1) | vote_len (4, BE) | vote bytes ("host:port")
 ```
+
+`RaftHardStateStore` owns this file as `state`; its replacement file is
+`state.tmp`. A missing `state` file means `{term = 0, voted_for = nullopt}`.
+The persistence surface rejects decreasing terms and replacing or clearing an
+existing vote within the same term. Repeating the same state is idempotent,
+and a higher term may clear the prior term's vote.
 
 It is rewritten in full on every change, which happens at most a few times per election — once when the term advances, once when a vote is granted. Write to a temporary file, `fsync`, `rename` over the original, then `fsync` the directory. That gives atomic replacement, so a crash mid-write leaves either the old contents or the new ones and never a torn record.
 
