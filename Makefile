@@ -25,6 +25,7 @@ SRC = \
 	src/Raft/RaftLog.cpp \
 	src/Raft/NodeAddress.cpp \
 	src/Raft/RaftState.cpp \
+	src/Raft/RaftApplier.cpp \
 	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
@@ -66,6 +67,7 @@ OBJ = \
 	build/Raft/RaftLog.o \
 	build/Raft/NodeAddress.o \
 	build/Raft/RaftState.o \
+	build/Raft/RaftApplier.o \
 	build/storage/Index.o \
 	build/Log/Segment.o \
 	build/Log/Store.o \
@@ -170,6 +172,8 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
+build/tests/integration/RaftApplier_test: CXXFLAGS += -pthread
+build/tests/integration/RaftApplier_test: LDLIBS += -pthread
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
 build/tests/unit/BTreeOperation_test: CXXFLAGS += -pthread
