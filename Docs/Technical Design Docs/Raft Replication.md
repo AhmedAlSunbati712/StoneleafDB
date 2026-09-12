@@ -348,6 +348,11 @@ So the apply loop is not running lock-free — on the leader it runs *inside* an
 ```c++
 enum class Locking : std::uint8_t { Acquire, Skip };
 
+// Whether commit() makes its commit record durable before returning. Defer is
+// for the apply loop only: commit() releases the transaction's locks, so a
+// client transaction using it would release them before the commit is durable.
+enum class Durability : std::uint8_t { Sync, Defer };
+
 KeyStoreStatus put(
     const TransactionHandle &transaction,
     const Key &key,
@@ -393,7 +398,7 @@ apply loop:
             switch operation.type:
                 case Put:    KeyStore.put(txn, operation.key, operation.value, Locking::Skip)
                 case Delete: KeyStore.remove(txn, operation.key, Locking::Skip)
-        txn.commit(sync_wal_log=False)
+        TxnMgr.commit(txn, Durability::Defer)   // no fsync yet; the batch syncs once below
         batch_end++
         num_applied++
     flush wal log
