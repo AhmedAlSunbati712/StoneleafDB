@@ -84,7 +84,8 @@ Lsn TransactionManager::append_action(const TransactionHandle& transaction, Pend
     return action_lsn;
 }
 
-CommitStatus TransactionManager::commit(const TransactionHandle& transaction) {
+CommitStatus TransactionManager::commit(const TransactionHandle& transaction,
+                                        Durability durability) {
     {
         std::unique_lock lock(transactions_mutex_);
         if (!owns_handle_locked(transaction)) return CommitStatus::TransactionNotFound;
@@ -98,7 +99,9 @@ CommitStatus TransactionManager::commit(const TransactionHandle& transaction) {
     // A commit decision is acknowledged only after its WAL record is durable.
     const Lsn commit_lsn = log_.append(WalRecords::commit(transaction->id_, transaction->last_lsn_));
     transaction->last_lsn_ = commit_lsn;
-    log_.sync_through(commit_lsn);
+    if (durability == Durability::Sync) {
+        log_.sync_through(commit_lsn);
+    }
 
     {
         std::unique_lock lock(transactions_mutex_);
