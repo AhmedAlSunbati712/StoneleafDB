@@ -291,9 +291,9 @@ return to the user
 ```
 
 ### Checking leadership
-A session that arrives at a follower is rejected at accept time, before a handler thread is spawned: the acceptor reads `state` and `leader_address` under `state_mutex` and replies with `{Failed, leader_client_address()}` immediately. That keeps a follower from paying for a thread and a parse just to say "not me."
+A session that arrives at a follower is rejected at accept time, before a handler thread is spawned: the acceptor reads `state` and `leader_raft_address` under `state_mutex` and replies with `{Failed, leader_client_address()}` immediately. That keeps a follower from paying for a thread and a parse just to say "not me."
 
-The redirect must carry the leader's **client** address. `leader_address` is learned from `AppendEntries`, so it is the leader's Raft (gRPC) address; a client sent there would reach the gRPC port and fail the protocol. `leader_client_address()` translates it through `client_addr_of` (see *Raft State*).
+The redirect must carry the leader's **client** address. `leader_raft_address` is learned from `AppendEntries`, so it is the leader's Raft (gRPC) address; a client sent there would reach the gRPC port and fail the protocol. `leader_client_address()` translates it through `cluster_nodes` (see *Raft State*).
 
 That check is a fast path, not the correctness-critical one. **Leadership can change mid-session** — a transaction may open while we are leader, buffer writes for seconds, and reach `COMMIT` after we have been deposed. So the propose path re-checks, and the re-check must be atomic with the append: verifying leadership, reading `current_term`, and appending happen under a single hold of `state_mutex`. Split them and a deposed server stamps an entry with a stale term, which a new leader then truncates while the session waits on an index that will never apply.
 
@@ -534,6 +534,8 @@ It is rewritten in full on every change, which happens at most a few times per e
 
 The write must complete **before** the RPC that depends on it is sent: before a `RequestVote` goes out with a new term, and before a `vote_granted = true` reply leaves the server. Advertise a term you then forget across a crash, and you can vote twice in it.
 
+`RaftState` does these writes itself: `advance_term()`, `grant_vote()` and `become_candidate()` call `RaftHardStateStore::persist()` before returning, while the caller holds `state_mutex`. See *Locking discipline* for why the lock is held.
+
 ### Concurrency
 `RaftLog` carries its own `shared_mutex`, so reads by the replication threads and the apply loop run concurrently with each other.
 
@@ -563,7 +565,7 @@ replication thread for follower i:
 
         entries <- RaftLog.ScanRead(send_next[i])
         result  <- grpc_clients[i].append_entries(
-                       sent_term, leader_addr, prev_idx, prev_term, entries)
+                       sent_term, self_raft_address, prev_idx, prev_term, entries)
 
         if result.term > current_term:
             current_term <- result.term
@@ -634,9 +636,9 @@ on AppendEntries(term, leader, prev_index, prev_term, entries, leader_commit):
     // timer BEFORE the consistency check: a log mismatch does not mean the
     // leader is dead, it means the leader is alive and repairing us.
     if term > current_term or state != Follower:
-        become_follower(term, leader)          // resets timer, sets leader_address
+        become_follower(term, leader)          // resets timer, sets leader_raft_address
     else:
-        leader_address <- leader
+        leader_raft_address <- leader
         reset_election_timer()
 
     // 2. Consistency check. prev_index 0 is a vacuous match: nothing precedes
@@ -687,14 +689,14 @@ on AppendEntries(term, leader, prev_index, prev_term, entries, leader_commit):
 
 **Durability precedes the reply**, per *Durability* above: reply `success = true` before `sync_through()` returns and the leader may count us toward a majority for an entry we lose in a crash. Truncation is covered by the same sync.
 
-**One deliberate exception to the locking rule.** This handler holds `state_mutex` across `sync_through()`, which is I/O — the one place the rule under *Locking discipline* is broken on purpose. Releasing the lock between the state decision and the log write would let a concurrent `AppendEntries` from a different term interleave its truncation with ours, and the check would no longer mean anything by the time we acted on it. The cost is acceptable because a follower has nothing else to do: its sessions are idle, other `AppendEntries` must serialize anyway, and the election timer was just reset so it cannot fire during the write. Lock ordering is still `state_mutex` → `raft_log_mutex`, which is exactly the inversion this handler would otherwise introduce by consulting the log before taking Raft state.
+**A deliberate exception to the locking rule.** This handler holds `state_mutex` across `sync_through()`, which is I/O — one of the two places the rule under *Locking discipline* is broken on purpose (the other is persisting term and vote). Releasing the lock between the state decision and the log write would let a concurrent `AppendEntries` from a different term interleave its truncation with ours, and the check would no longer mean anything by the time we acted on it. The cost is acceptable because a follower has nothing else to do: its sessions are idle, other `AppendEntries` must serialize anyway, and the election timer was just reset so it cannot fire during the write. Lock ordering is still `state_mutex` → `raft_log_mutex`, which is exactly the inversion this handler would otherwise introduce by consulting the log before taking Raft state.
 
 ## Raft State
 An object that will live on every server and used extensively through the controller layer (the client handler, replication and follower threads).
 
 Three invariants are enforced through the method surface rather than left to callers, because all three are silent when violated:
 
-1. **A vote belongs to exactly one term.** `advance_term()` is the only way to change the term and always clears `voted_for` in the same step. Splitting these into independent fields makes it possible to raise the term and forget the vote, which lets the server grant a second vote in a term it already voted in — two leaders, one term.
+1. **A vote and known leader belong to exactly one term.** `advance_term()` is the only way to change the term; it atomically replaces `voted_for` and clears `leader_raft_address`. Splitting these into independent fields makes it possible to carry stale election state into a new term — either granting a second vote or redirecting clients to a leader from an older term.
 2. **Leader-only state is per-leadership, not per-process.** `send_next` and `replicated_index` are reinitialized by `become_leader()` on every election win. Initializing them once in the constructor leaves a re-elected leader reusing stale progress from its previous term.
 3. **The cluster config is the only source of address spellings.** Address-as-identity means every comparison and every hash is a string comparison, so a node that spells itself two ways is two nodes. Rather than normalizing or resolving at runtime, the spellings are fixed once and never derived:
 
@@ -706,12 +708,12 @@ Three invariants are enforced through the method surface rather than left to cal
      10.0.0.2:5001     10.0.0.2:6001
      10.0.0.3:5001     10.0.0.3:6001
      ```
-   - Each node is launched with `--self` set to its own **client** address, which must match exactly one row's `client_addr`. That row's `raft_addr` becomes `node_address`. `RaftState`'s constructor takes the full list plus that self address, asserts membership, partitions the Raft addresses into `node_address` and `node_addresses`, and builds `client_addr_of`. A mismatch is a startup failure, not a runtime surprise.
-   - **The Raft address is the node's identity**: `voted_for`, the `send_next` / `replicated_index` keys, the RPC sender field, and the vote file all use it. The client address is never compared or hashed; its only use is being handed to a client in a redirect, via `client_addr_of`.
+   - Each node is launched with `--self` set to its own **client** address, which must match exactly one row's `client_addr`. That row's `raft_addr` becomes `self_raft_address`. `RaftState`'s constructor takes the full list plus that self address, asserts membership, partitions the Raft addresses into `self_raft_address` and `peers`, and builds `cluster_nodes`. A mismatch is a startup failure, not a runtime surprise.
+   - **The Raft address is the node's identity**: `voted_for`, the `send_next` / `replicated_index` keys, the RPC sender field, and the vote file all use it. The client address is never compared or hashed; its only use is being handed to a client in a redirect, via `cluster_nodes`.
    - Every RPC carries the sender's own configured address, copied verbatim from that file.
    - **Addresses are never derived from a socket.** `getpeername()` is not used for identity anywhere. It returns `127.0.0.1:5001` on one connection and `localhost:5001` or `::ffff:127.0.0.1:5001` on another; those hash differently, so `voted_for == candidate` fails and the server grants a second vote in a term it has already voted in — two leaders, arriving through string comparison.
 
-   With identical configs, exact string equality is always correct and no normalization or DNS resolution is needed. The membership check on inbound RPCs (`sender not in node_addresses` -> reject) then earns its keep as a **config-drift detector**: with correct configs it can never fire, so if it does, two nodes disagree about the cluster and you want to know immediately rather than during an election.
+   With identical configs, exact string equality is always correct and no normalization or DNS resolution is needed. The membership check on inbound RPCs (`sender not in peers` -> reject) then earns its keep as a **config-drift detector**: with correct configs it can never fire, so if it does, two nodes disagree about the cluster and you want to know immediately rather than during an election.
 
 **A note on the leader-only maps and threading.** `send_next` and `replicated_index` are read and written by one replication thread per peer, each touching only its own key. That is safe *only* because `become_leader()` inserts every key up front: modifying distinct elements of a container concurrently is not a data race, but an insertion can rehash and invalidate everything. So the replication threads must never insert. Use `.at()` rather than `operator[]` in those threads — `operator[]` default-constructs a missing key, which is exactly the insertion that breaks this, while `.at()` throws and surfaces the bug immediately.
 
@@ -720,13 +722,20 @@ Three invariants are enforced through the method surface rather than left to cal
 // Nodes are identified by address rather than by a separate id, so this is
 // also the type persisted in voted_for and sent on the wire.
 struct NodeAddress {
-    std::string   host;   // exactly as written in the cluster config
+    std::string host;     // exactly as written in the cluster config
     std::uint16_t port;
 
     bool operator==(const NodeAddress&) const = default;
     auto operator<=>(const NodeAddress&) const = default;
 
-    std::string to_string() const;   // "host:port" - also the gRPC target
+    // "host:port". Also the gRPC target, and the form RaftHardStateStore
+    // persists voted_for in.
+    std::string to_string() const;
+
+    // Inverse of to_string(); splits on the last ':'. Used to read the cluster
+    // config and the persisted vote. Must round-trip exactly -
+    // from_string(s).to_string() == s - or config spellings drift.
+    static NodeAddress from_string(std::string_view text);
 };
 
 // Required to key an unordered_map on NodeAddress.
@@ -741,8 +750,8 @@ struct std::hash<NodeAddress> {
 
 // One row of the cluster config.
 struct ClusterMember {
-    NodeAddress raft;     // gRPC address; the node's identity
-    NodeAddress client;   // where database clients connect; only ever handed to clients
+    NodeAddress raft;             // gRPC address; the node's identity
+    NodeAddress database_server;  // where database clients connect; only ever handed to clients
 };
 
 enum class State : std::uint8_t {
@@ -750,139 +759,235 @@ enum class State : std::uint8_t {
     Follower,
     Candidate,
 };
+
 class RaftState {
     public:
-        // cluster is the full config list including ourselves; self_client
-        // must match exactly one entry's client address or construction
-        // fails. That entry's raft address becomes node_address, the other
-        // raft addresses become node_addresses, and every row populates
-        // client_addr_of.
-        RaftState(State state,
-                  std::vector<ClusterMember> cluster,
-                  NodeAddress self_client,
-                  std::uint64_t last_raft_index,
-                  std::uint64_t last_raft_term,
+        // cluster is every row of the cluster config, including this node.
+        // self_client_address is the --self flag: this node's database server
+        // address. It must match exactly one row's database_server, or
+        // construction throws; that row's raft address becomes
+        // self_raft_address and every other row's raft address goes in peers.
+        // current_term and voted_for are loaded from hard_state_store, which
+        // must already be open and must outlive this object. last_applied
+        // comes from ARIES recovery, and commit_index starts equal to it. The
+        // node always starts as a Follower, and the constructor calls
+        // reset_election_timer() so an existing leader gets one full timeout
+        // to reach us before we campaign.
+        RaftState(std::vector<ClusterMember> cluster,
+                  const NodeAddress& self_client_address,
+                  RaftHardStateStore& hard_state_store,
                   std::uint64_t last_applied);
 
-        // --- Term and vote -------------------------------------------------
+        // Every method below requires the caller to hold state_mutex for its
+        // whole duration. None of them perform I/O, except advance_term(),
+        // grant_vote() and become_candidate(): they persist term and vote
+        // through hard_state_store before returning, deliberately while the
+        // caller holds state_mutex. See Locking discipline.
+
+        // --- Term and vote --------------------------------------------------
         // The ONLY way to change the term. A vote is scoped to exactly one
-        // term, so raising the term always clears it in the same operation;
+        // term, so raising the term replaces it in the same operation;
         // exposing a bare term setter makes it possible to carry a stale vote
         // into a new term and grant a second vote in it, which allows two
-        // leaders in one term. Persists both fields before returning.
-        void advance_term(std::uint64_t new_term);   // asserts new_term > term
+        // leaders in one term. A new term also invalidates the prior leader.
+        // Persists (new_term, new_vote) before returning.
+        void advance_term(std::uint64_t new_term,
+                          std::optional<NodeAddress> new_vote = std::nullopt);
 
-        // Grants a vote only if we have not already voted this term and the
-        // candidate's log is at least as up to date as ours. Persists before
-        // returning, so the reply never leaves before the vote is durable.
-        bool grant_vote(const NodeAddress& candidate, std::uint64_t last_log_index, std::uint64_t last_log_term);
+        // Grants the vote if we have not voted for a different candidate this
+        // term and the candidate's log is at least as up to date as ours:
+        // a later last term wins; on equal terms, the longer or equal log
+        // wins. Our own last index and term come from RaftLog, which the
+        // caller reads while holding state_mutex (lock order: state_mutex ->
+        // raft log mutex). On a grant, persists (current_term, candidate)
+        // before returning, so the reply never leaves before the vote is
+        // durable.
+        bool grant_vote(const NodeAddress& candidate,
+                        std::uint64_t candidate_last_log_index,
+                        std::uint64_t candidate_last_log_term,
+                        std::uint64_t own_last_log_index,
+                        std::uint64_t own_last_log_term);
 
-        // --- State transitions ---------------------------------------------
-        // Clears and fully repopulates send_next and replicated_index, one
-        // entry per peer. This must run on EVERY election win, not once at
-        // construction: a server that leads in term 5, steps down, and leads
-        // again in term 9 would otherwise reuse stale progress from its first
-        // leadership, believe followers are further along than they are, and
-        // skip entries they never received. Clearing rather than overwriting
-        // also drops entries for peers no longer in the configuration.
+        // --- State transitions ----------------------------------------------
+        // Atomically: advance the term by one, vote for ourselves, clear
+        // votes, state = Candidate, reset_election_timer(). Persists the new
+        // term and self-vote before returning, so no RequestVote can go out
+        // carrying a term that is not durable.
+        void become_candidate();
+
+        // Clears and fully repopulates send_next (last_log_index + 1) and
+        // replicated_index (0), one entry per peer. This must run on EVERY
+        // election win, not once at construction: a server that leads in term
+        // 5, steps down, and leads again in term 9 would otherwise reuse stale
+        // progress from its first leadership, believe followers are further
+        // along than they are, and skip entries they never received. Records
+        // this node as the leader for the new leadership.
         void become_leader(std::uint64_t last_log_index);
+
+        // If new_term > current_term, calls advance_term(), which persists.
+        // Records the leader (nullopt when the higher term arrived on a
+        // RequestVote or an RPC response), sets state = Follower, resets the
+        // election timer, and notifies election_cv so a parked ex-leader
+        // starts timing again.
         void become_follower(std::uint64_t new_term, std::optional<NodeAddress> leader);
 
-        // --- Client redirects ----------------------------------------------
-        // The leader's CLIENT address, for NotLeader redirects:
-        // client_addr_of.at(*leader_address), or nullopt when leader_address
-        // is nullopt. Never hand leader_address itself to a client - it is
-        // a Raft address.
-        std::optional<NodeAddress> leader_client_address() const;
-
-        // --- Election timing -------------------------------------------------
-        // Redraws election_deadline from the randomized range. become_candidate()
-        // and become_follower() call it internally, so the only explicit callers
-        // are the two handlers that hear from a legitimate peer without changing
-        // state: AppendEntries from the current leader while already a follower,
-        // and RequestVote at the moment a vote is granted.
+        // --- Election timing ------------------------------------------------
+        // election_deadline = now + random(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX).
+        // become_candidate(), become_follower() and the constructor call it
+        // internally, so the only explicit callers are the two handlers that
+        // hear from a legitimate peer without changing state: AppendEntries
+        // from the current leader while already a follower, and RequestVote
+        // at the moment a vote is granted.
         void reset_election_timer();
 
-    // Every method above assumes the caller holds state_mutex for its whole
-    // duration, and none of them perform I/O.
+        // --- Client redirects -----------------------------------------------
+        // The leader's database server address:
+        // cluster_nodes_.at(*leader_raft_address_), or nullopt when no leader
+        // is known. Never hand leader_raft_address() itself to a client - it
+        // is a gRPC address.
+        std::optional<NodeAddress> leader_client_address() const;
 
-    private:
-        State state;
-        std::size_t cluster_size; // len(cluster), i.e. peers + ourselves
+        // --- Accessors ------------------------------------------------------
+        // For the election thread, replication threads, apply loop, sessions
+        // and RPC handlers. There are deliberately no setters for state,
+        // current_term, voted_for, votes, or which peers the progress maps
+        // hold: those change only through the methods above, which is how the
+        // invariants under Raft State stay enforced.
+        State state() const noexcept { return state_; }
+        std::uint64_t current_term() const noexcept { return current_term_; }
+        const std::optional<NodeAddress>& voted_for() const noexcept { return voted_for_; }
+        const std::optional<NodeAddress>& leader_raft_address() const noexcept { return leader_raft_address_; }
+        const NodeAddress& self_raft_address() const noexcept { return self_raft_address_; }
+        const std::vector<NodeAddress>& peers() const noexcept { return peers_; }
+        std::size_t cluster_size() const noexcept { return cluster_size_; }
+        std::uint64_t commit_index() const noexcept { return commit_index_; }
+        std::uint64_t last_applied() const noexcept { return last_applied_; }
+        std::chrono::steady_clock::time_point election_deadline() const noexcept { return election_deadline_; }
 
-        // Persistent: both must be fsynced before any RPC reply that depended
-        // on them leaves this server. Kept outside the Raft log, which has
-        // different truncation rules. current_term is NOT derivable from the
-        // log - it is raised on becoming a candidate and on seeing a higher
-        // term in any RPC, both of which happen without appending an entry,
-        // so it can legitimately exceed the term of every entry we hold.
-        std::uint64_t current_term;
-        std::optional<NodeAddress> voted_for;
+        // Membership check for inbound RPCs. With byte-identical configs it can
+        // never fail; if it does, two nodes disagree about the cluster.
+        bool is_peer(const NodeAddress& address) const {
+            return address != self_raft_address_ && cluster_nodes_.contains(address);
+        }
 
-        // Volatile, leaders only. Cleared and fully repopulated by
-        // become_leader(), never trusted across a leadership change.
-        // One entry per peer, self excluded.
-        std::unordered_map<NodeAddress, std::uint64_t> send_next;        // -> last_log_index + 1
-        std::unordered_map<NodeAddress, std::uint64_t> replicated_index; // -> 0
+        // Leader-only progress for one peer. .at() on purpose: become_leader()
+        // inserts every key up front, and an unknown peer is a bug that must
+        // throw rather than insert - an insertion can rehash the map while
+        // another replication thread is using it.
+        std::uint64_t send_next(const NodeAddress& peer) const { return send_next_.at(peer); }
+        std::uint64_t replicated_index(const NodeAddress& peer) const { return replicated_index_.at(peer); }
 
-        // Volatile in the paper, but our state machine is durable, so neither
-        // starts at 0 - both are seeded from ARIES recovery. See below.
-        std::uint64_t commit_index;
-        std::uint64_t last_applied;
+        // Every peer's replicated index, for advance_commit_index()'s majority count.
+        const std::unordered_map<NodeAddress, std::uint64_t>& replicated_indexes() const noexcept {
+            return replicated_index_;
+        }
 
-        std::vector<NodeAddress> node_addresses; // every peer's raft address, self excluded
-        NodeAddress node_address;                // our own raft address
+        // --- Mutators -------------------------------------------------------
+        // AppendEntries from the current leader while already a Follower in the
+        // same term. A higher term goes through become_follower() instead.
+        void set_leader_raft_address(const NodeAddress& leader) { leader_raft_address_ = leader; }
 
-        // raft address -> client address, for every node including ourselves.
-        // Built once from the cluster config; never modified.
-        std::unordered_map<NodeAddress, NodeAddress> client_addr_of;
+        void set_send_next(const NodeAddress& peer, std::uint64_t index) { send_next_.at(peer) = index; }
+        void set_replicated_index(const NodeAddress& peer, std::uint64_t index) { replicated_index_.at(peer) = index; }
 
-        // Raft address of who we currently believe the leader is. Followers
-        // learn it from AppendEntries. Clients are redirected to
-        // leader_client_address(), never to this. nullopt while we have not
-        // heard from a leader this term.
-        std::optional<NodeAddress> leader_address;
+        // Both only move forward: committed entries stay committed, and entries
+        // are applied in order and only once committed.
+        void set_commit_index(std::uint64_t index) {
+            assert(index >= commit_index_);
+            commit_index_ = index;
+        }
+        void set_last_applied(std::uint64_t index) {
+            assert(index >= last_applied_ && index <= commit_index_);
+            last_applied_ = index;
+        }
 
-        // --- Synchronization -------------------------------------------------
+        // Records a granted vote from peer in the current campaign. Returns true
+        // once we hold a majority, counting our own vote. votes_ is a set, so a
+        // duplicate reply from the same peer cannot count twice.
+        bool record_vote(const NodeAddress& peer) {
+            votes_.insert(peer);
+            return votes_.size() + 1 >= cluster_size_ / 2 + 1;
+        }
+
+        // --- Synchronization ------------------------------------------------
+        // Public because callers lock state_mutex around multi-step sequences
+        // (check leadership, read the term, append) and other threads wait on
+        // the condition variables.
+        //
         // One coarse mutex guards every field in this class. Critical sections
         // are a handful of integer reads and writes, so contention is not a
         // concern at this cluster size, and a single lock removes any question
         // of lock ordering between the session threads, the apply loop, the
-        // replication threads and the RPC handlers.
-        //
-        // std::mutex rather than std::shared_mutex specifically because
-        // std::condition_variable only composes with std::mutex; the
-        // shared_mutex equivalent, condition_variable_any, is slower and buys
-        // nothing here.
+        // replication threads and the RPC handlers. std::mutex rather than
+        // std::shared_mutex because std::condition_variable only composes with
+        // std::mutex.
         mutable std::mutex state_mutex;
 
-        // Four condition variables rather than one, so a notification wakes only
-        // the threads that can actually make progress. They all share
-        // state_mutex, which is legal and keeps every wait predicate a plain
-        // read of the fields above.
+        // Four condition variables rather than one, so a notification wakes
+        // only the threads that can actually make progress. All share
+        // state_mutex.
         std::condition_variable election_cv;    // election thread: deadline reached, or we stopped being Leader
         std::condition_variable apply_cv;       // apply loop: commit_index > last_applied (notify_one, single waiter)
-        std::condition_variable applied_cv;     // sessions: last_applied >= their own idx (notify_all, many waiters at different indices)
-        std::condition_variable replication_cv; // replication threads: entries appended (notify_all, every peer needs them)
+        std::condition_variable applied_cv;     // sessions: last_applied >= their own idx (notify_all, many waiters)
+        std::condition_variable replication_cv; // replication threads: entries appended, or we became leader (notify_all)
 
-        // --- Election timing -------------------------------------------------
-        std::chrono::steady_clock::time_point election_deadline;
+        // Set under state_mutex at shutdown, then every condition variable is
+        // notified. Tested by EVERY wait predicate in the server: a thread
+        // parked on a condition variable cannot be stopped any other way.
+        bool shutting_down = false;
 
+        // --- Timing constants -----------------------------------------------
         static constexpr auto ELECTION_TIMEOUT_MIN = std::chrono::milliseconds(150);
         static constexpr auto ELECTION_TIMEOUT_MAX = std::chrono::milliseconds(300);
         static constexpr auto HEARTBEAT_INTERVAL   = std::chrono::milliseconds(50);
+
+    private:
+        RaftHardStateStore& hard_state_store_;
+
+        State state_ = State::Follower;
+
+        // Persistent: written through hard_state_store_ before any RPC or reply
+        // that depends on them leaves this server. current_term is NOT
+        // derivable from the log - it is raised on becoming a candidate and on
+        // seeing a higher term in any RPC, both of which happen without
+        // appending an entry, so it can exceed the term of every entry we hold.
+        std::uint64_t current_term_ = 0;
+        std::optional<NodeAddress> voted_for_; // gRPC address of the node we voted for this term
+
+        std::optional<NodeAddress> leader_raft_address_; // gRPC address of the leader; nullopt until we hear from one this term or become leader
+        NodeAddress self_raft_address_;                   // gRPC address of this node; its identity
+        std::vector<NodeAddress> peers_;                  // every other node's gRPC address, self excluded
+
+        // gRPC address -> database server address, for every node including
+        // ourselves. Built once from the cluster config; never modified.
+        std::unordered_map<NodeAddress, NodeAddress> cluster_nodes_;
+        std::size_t cluster_size_ = 0; // cluster_nodes_.size(): peers + ourselves. Used for majority
+
+        // Leader-only. Cleared and fully repopulated by become_leader() on
+        // every election win, never trusted across a leadership change. One
+        // entry per peer, self excluded.
+        std::unordered_map<NodeAddress, std::uint64_t> send_next_;        // next raft log index to send each peer
+        std::unordered_map<NodeAddress, std::uint64_t> replicated_index_; // highest index known replicated on each peer
+
+        // Peers that granted us a vote in the current campaign. Cleared by
+        // become_candidate().
+        std::unordered_set<NodeAddress> votes_;
+
+        // Volatile in the paper, but our state machine is durable, so neither
+        // starts at 0 - both are seeded from ARIES recovery.
+        std::uint64_t commit_index_ = 0; // highest index known replicated on a majority
+        std::uint64_t last_applied_ = 0; // highest index applied to the state machine
+
+        // When the election thread starts an election if nothing resets it
+        // first. Set by the constructor via reset_election_timer().
+        std::chrono::steady_clock::time_point election_deadline_;
 
         // Redrawn on every reset, never drawn once at startup: a fixed per-node
         // timeout makes the same two nodes split the vote every round forever.
         // Seed from std::random_device per node - seeding every node identically
         // (a fixed seed in a test harness, or a default-constructed engine) makes
         // them all draw the same sequence and split the vote permanently.
-        std::mt19937 timeout_rng;
-
-        // Tested by EVERY condition-variable predicate in the server. A thread
-        // parked on a condvar cannot be interrupted any other way, so without
-        // this there is no clean shutdown. See Threads and Lifecycle.
-        bool shutting_down = false;
+        std::mt19937 timeout_rng_;
 };
 ```
 
@@ -890,6 +995,8 @@ class RaftState {
 Two rules, both of which are load-bearing:
 
 **Never hold `state_mutex` across I/O.** Mutate state under the lock, copy out whatever the call needs into locals, release, then do the network or disk work. `become_candidate()` runs under the lock; the `RequestVote` fan-out that follows does not. Holding it across an RPC serializes every session thread behind a network round trip, and it deadlocks the first time two nodes campaign at each other simultaneously.
+
+**Two deliberate exceptions.** The `AppendEntries` receiver holds it across `sync_through()` (see *Receiving AppendEntries*). And `advance_term()`, `grant_vote()` and `become_candidate()` persist term and vote through `RaftHardStateStore` while the caller holds it. Persisting after unlocking would let a replication thread or another handler read the new term and put it in an RPC before it is on disk; a crash then brings the node back at the old term, free to vote a second time in the term it advertised. The cost is one small file rewrite and two fsyncs, a few times per election.
 
 The apply loop follows the same shape, and it matters more there because its work is long:
 
@@ -933,7 +1040,7 @@ The paper treats both as volatile and initializes them to 0, because it assumes 
 1. Run ARIES recovery against the WAL — analysis, redo, then undo. Any apply transaction without a `TxnCommit` record is rolled back, so the database never resumes mid-entry and a partially applied entry cannot survive.
 2. `last_applied` <- the **highest** `raft_index` appearing in a *committed* apply transaction. Since apply is strictly sequential in index order, this coincides with the last committed apply transaction in the log. Zero when there are none, i.e. a fresh database.
 3. `commit_index` <- `last_applied`.
-4. `state` <- `Follower`, `leader_address` <- `nullopt`.
+4. `state` <- `Follower`, `leader_raft_address` <- `nullopt`.
 
 Step 3 is safe because we only ever apply committed entries and committed entries stay committed (State Machine Safety), so `last_applied` is always a valid lower bound on `commit_index`.
 
@@ -962,33 +1069,33 @@ struct RequestVoteResponse {
 ```
 
 ### Becoming a candidate
-`become_candidate()` runs under `state_mutex` and does four things atomically, which is why it is one method and not four calls: increment the term, vote for itself, set the state, and redraw the election deadline. Splitting them lets a server campaign without having voted for itself, or campaign twice in one term.
+`become_candidate()` runs under `state_mutex` and does four things atomically, which is why it is one method and not four calls: increment the term, vote for itself, set the state, and redraw the election deadline. Splitting them lets a server campaign without having voted for itself, or campaign twice in one term. It also persists the new term and self-vote through `RaftHardStateStore` before returning.
 
 ```
 election thread, on deadline expiry:
     lock(state_mutex)
     become_candidate()          // advance_term(current_term + 1) clears voted_for,
-                                // then voted_for <- node_address, state <- Candidate,
-                                // then reset_election_timer()
-    persist(current_term, voted_for)     // MUST be durable before any RPC goes out
+                                // then voted_for <- self_raft_address, state <- Candidate,
+                                // then reset_election_timer(). Persists the term and
+                                // self-vote before returning: durable before any RPC goes out
     campaign_term   <- current_term
     last_log_index  <- RaftLog.last_index()
     last_log_term   <- RaftLog.last_term()
     unlock
 
     // I/O outside the lock. One thread per peer, all in parallel.
-    for each peer in node_addresses:
-        send RequestVote(campaign_term, node_address, last_log_index, last_log_term)
+    for each peer in peers:
+        send RequestVote(campaign_term, self_raft_address, last_log_index, last_log_term)
 ```
 
-The persist before sending is not optional. If we advertise term 7 and crash before the term reaches disk, we come back at term 6 and can vote a second time in term 7.
+The persist inside `become_candidate()` is not optional. If we advertise term 7 and crash before the term reaches disk, we come back at term 6 and can vote a second time in term 7.
 
 ### Receiving a RequestVote
 ```
 on RequestVote(term, candidate, cand_last_index, cand_last_term):
     lock(state_mutex)
 
-    if candidate not in node_addresses:
+    if candidate not in peers:
         reject                                  // config drift; see invariant 3
 
     if term < current_term:
@@ -997,12 +1104,12 @@ on RequestVote(term, candidate, cand_last_index, cand_last_term):
     if term > current_term:
         become_follower(term, nullopt)          // clears voted_for, resets timer
 
-    granted <- (voted_for == nullopt or voted_for == candidate)
-               and candidate_log_is_up_to_date(cand_last_index, cand_last_term)
+    // Checks voted_for and candidate_log_is_up_to_date(); on a grant, records
+    // the vote and persists it before returning, so BEFORE the reply is sent.
+    granted <- grant_vote(candidate, cand_last_index, cand_last_term,
+                          RaftLog.last_index(), RaftLog.last_term())
 
     if granted:
-        voted_for <- candidate
-        persist(current_term, voted_for)        // durable BEFORE the reply is sent
         reset_election_timer()                  // only on grant, never on denial
 
     return {current_term, vote_granted = granted}
@@ -1035,10 +1142,8 @@ on RequestVoteResponse(from peer, resp):
     if resp.term != campaign_term or state != Candidate:
         return
 
-    if resp.vote_granted:
-        votes.insert(peer)
-        if votes.size() + 1 >= cluster_size / 2 + 1:   // +1 counts our own vote
-            win_election()
+    if resp.vote_granted and record_vote(peer):  // true once votes + our own reach a majority
+        win_election()
 ```
 
 `votes` is a `std::unordered_set<NodeAddress>` scoped to one campaign, so a duplicate reply from the same peer cannot be counted twice. `become_candidate()` clears it.
@@ -1109,8 +1214,8 @@ A step-down while an RPC is in flight needs no special handling: the reply arriv
 Order matters in two places, so this is a sequence and not a set:
 
 1. ARIES recovery over the WAL — the database reaches a transactionally consistent state.
-2. Open `RaftLog`; read the persisted `current_term` and `voted_for`.
-3. Construct `RaftState`, seeding `last_applied` and `commit_index` per *Seeding `commit_index` and `last_applied` on startup*. State is `Follower`.
+2. Open `RaftLog` and `RaftHardStateStore`.
+3. Construct `RaftState` from the cluster config, `--self`, and the open `RaftHardStateStore` (it loads `current_term` and `voted_for` itself), seeding `last_applied` and `commit_index` per *Seeding `commit_index` and `last_applied` on startup*. State is `Follower`.
 4. Start the apply loop.
 5. Start the RPC server. **Before step 7** — a server that campaigns before it can receive `RequestVote` replies cannot win, and worse, cannot answer its peers.
 6. Start the replication threads. They park immediately, since we begin as a follower.
@@ -1136,4 +1241,4 @@ Threads differ in how they treat errors, and the difference is deliberate:
 - **Session threads absorb their own errors.** A client disconnecting mid-transaction aborts it and releases its locks, as `serve_connection` already does today.
 
 ## Gaps not Filled yet
-- **Commit Status wire encoding**: `CommitResult { Success, Failed, Unknown }` and where each value is produced are now designed under *Returning the commit result*. What remains is purely the wire format: how the three values plus an optional redirect to the leader's client address (`leader_client_address()`, never the Raft `leader_address`) are encoded in the client response, alongside the existing size-prefixed command protocol.
+- **Commit Status wire encoding**: `CommitResult { Success, Failed, Unknown }` and where each value is produced are now designed under *Returning the commit result*. What remains is purely the wire format: how the three values plus an optional redirect to the leader's client address (`leader_client_address()`, never the Raft `leader_raft_address`) are encoded in the client response, alongside the existing size-prefixed command protocol.

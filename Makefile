@@ -23,6 +23,8 @@ SRC = \
 	src/Raft/RaftHardStateStore.cpp \
 	src/Raft/RaftSegment.cpp \
 	src/Raft/RaftLog.cpp \
+	src/Raft/NodeAddress.cpp \
+	src/Raft/RaftState.cpp \
 	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
@@ -62,6 +64,8 @@ OBJ = \
 	build/Raft/RaftHardStateStore.o \
 	build/Raft/RaftSegment.o \
 	build/Raft/RaftLog.o \
+	build/Raft/NodeAddress.o \
+	build/Raft/RaftState.o \
 	build/storage/Index.o \
 	build/Log/Segment.o \
 	build/Log/Store.o \
