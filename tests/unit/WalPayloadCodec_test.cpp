@@ -65,3 +65,30 @@ TEST(WalPayloadCodecTest, FactoriesRejectInvalidTransactionMetadata) {
     EXPECT_THROW(WalRecords::abort(0, 1, AbortReason::ClientRequest), std::invalid_argument);
 }
 } // namespace
+
+TEST(WalPayloadCodecTest, CommitRecordCarriesTheRaftIndex) {
+    const auto stamped = WalRecords::commit(1, 2, 42).data;
+    EXPECT_EQ(stamped.size(), 8u);
+    EXPECT_EQ(std::get<CommitPayload>(WalPayloadCodec::decode(WalRecordType::TxnCommit, stamped)).raft_index, 42u);
+
+    // Client transactions apply no Raft entry, so they carry 0.
+    EXPECT_EQ(std::get<CommitPayload>(WalPayloadCodec::decode(
+        WalRecordType::TxnCommit, WalRecords::commit(1, 2).data)).raft_index, 0u);
+
+    // The whole 64-bit range round-trips, not just small indexes.
+    const std::uint64_t highest = 0xFFFFFFFFFFFFFFFFull;
+    EXPECT_EQ(std::get<CommitPayload>(WalPayloadCodec::decode(
+        WalRecordType::TxnCommit, WalRecords::commit(1, 2, highest).data)).raft_index, highest);
+}
+
+TEST(WalPayloadCodecTest, RejectsCommitPayloadsThatAreNotEightBytes) {
+    const auto encoded = WalRecords::commit(1, 2, 42).data;
+
+    std::vector<char> truncated(encoded.begin(), encoded.end() - 1);
+    EXPECT_THROW(WalPayloadCodec::decode(WalRecordType::TxnCommit, truncated), std::runtime_error);
+    EXPECT_THROW(WalPayloadCodec::decode(WalRecordType::TxnCommit, std::vector<char>{}), std::runtime_error);
+
+    std::vector<char> trailing = encoded;
+    trailing.push_back(0);
+    EXPECT_THROW(WalPayloadCodec::decode(WalRecordType::TxnCommit, trailing), std::runtime_error);
+}

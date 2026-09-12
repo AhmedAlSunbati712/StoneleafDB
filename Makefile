@@ -174,6 +174,8 @@ build/tests/unit/%: build/tests/unit/%.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
+build/tests/integration/RecoveryWatermark_test: CXXFLAGS += -pthread
+build/tests/integration/RecoveryWatermark_test: LDLIBS += -pthread
 build/tests/integration/RaftApplier_test: CXXFLAGS += -pthread
 build/tests/integration/RaftApplier_test: LDLIBS += -pthread
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
