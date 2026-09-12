@@ -16,7 +16,11 @@ enum class PageEffectKind : std::uint8_t { Write = 1, Allocate, Free };
 enum class SystemActionKind : std::uint8_t { BTreeSplit = 1, BTreeMerge, PageMaintenance };
 
 struct BeginPayload {};
-struct CommitPayload {};
+// raft_index is the Raft log index this transaction applied, or 0 when the
+// transaction applied no Raft entry. Raft indexes start at 1, so 0 is
+// unambiguous. Recovery takes the highest value over committed transactions
+// as last_applied.
+struct CommitPayload { std::uint64_t raft_index = 0; };
 struct EndPayload {};
 struct AbortPayload { AbortReason reason; };
 struct InsertUndo { Key key; };

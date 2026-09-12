@@ -92,8 +92,12 @@ public:
 
     // Commit and abort own the complete lifecycle boundary. I/O and WAL
     // corruption failures continue to use the logger's exception convention.
+    // raft_index is the Raft entry this transaction applied, recorded in its
+    // commit record so recovery can rebuild last_applied. Only the Raft apply
+    // loop passes one; client transactions apply no entry and leave it 0.
     CommitStatus commit(const TransactionHandle& transaction,
-                        Durability durability = Durability::Sync);
+                        Durability durability = Durability::Sync,
+                        std::uint64_t raft_index = 0);
     AbortStatus abort(const TransactionHandle& transaction, AbortReason reason);
 
     // Registers one complete blocker set through WaitForGraph::add_edges().

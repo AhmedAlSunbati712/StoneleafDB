@@ -120,7 +120,8 @@ namespace WalPayloadCodec {
 std::vector<char> encode(WalRecordType type, const WalPayload& payload) {
     require_payload_type(type, payload);
     Writer out;
-    if (type == WalRecordType::TxnBegin || type == WalRecordType::TxnCommit || type == WalRecordType::TxnEnd) return out.finish();
+    if (type == WalRecordType::TxnBegin || type == WalRecordType::TxnEnd) return out.finish();
+    if (type == WalRecordType::TxnCommit) { out.u64(std::get<CommitPayload>(payload).raft_index); return out.finish(); }
     if (type == WalRecordType::TxnAbort) {
         const auto reason = std::get<AbortPayload>(payload).reason;
         if (reason < AbortReason::ClientRequest || reason > AbortReason::InternalError) throw std::invalid_argument("Unknown abort reason");
@@ -144,7 +145,7 @@ WalPayload decode(WalRecordType type, std::span<const char> payload) {
     Reader in(payload); WalPayload result;
     switch (type) {
         case WalRecordType::TxnBegin: result = BeginPayload{}; break;
-        case WalRecordType::TxnCommit: result = CommitPayload{}; break;
+        case WalRecordType::TxnCommit: result = CommitPayload{in.u64()}; break;
         case WalRecordType::TxnEnd: result = EndPayload{}; break;
         case WalRecordType::TxnAbort: result = AbortPayload{checked_enum<AbortReason>(in.u8(), 1, 4, "Unknown abort reason")}; break;
         case WalRecordType::BTreeAction: {

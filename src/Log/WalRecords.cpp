@@ -23,7 +23,7 @@ PendingWalRecord begin(std::uint64_t txn) { return make(WalRecordType::TxnBegin,
 PendingWalRecord btree_action(std::uint64_t txn, Lsn prev, const BTreeActionPayload& p) { return make(WalRecordType::BTreeAction, txn, prev, p); }
 PendingWalRecord compensation(std::uint64_t txn, Lsn prev, const CompensationPayload& p) { return make(WalRecordType::Compensation, txn, prev, p); }
 PendingWalRecord system_action(const SystemActionPayload& p) { return make(WalRecordType::SystemAction, 0, 0, p); }
-PendingWalRecord commit(std::uint64_t txn, Lsn prev) { return make(WalRecordType::TxnCommit, txn, prev, CommitPayload{}); }
+PendingWalRecord commit(std::uint64_t txn, Lsn prev, std::uint64_t raft_index) { return make(WalRecordType::TxnCommit, txn, prev, CommitPayload{raft_index}); }
 PendingWalRecord abort(std::uint64_t txn, Lsn prev, AbortReason reason) { return make(WalRecordType::TxnAbort, txn, prev, AbortPayload{reason}); }
 PendingWalRecord end(std::uint64_t txn, Lsn prev) { return make(WalRecordType::TxnEnd, txn, prev, EndPayload{}); }
 WalPayload decode(const WalRecord& record) { return WalPayloadCodec::decode(record.type, record.data); }
