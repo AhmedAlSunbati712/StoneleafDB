@@ -27,6 +27,7 @@ SRC = \
 	src/Raft/NodeAddress.cpp \
 	src/Raft/RaftState.cpp \
 	src/Raft/RaftApplier.cpp \
+	src/Raft/ClusterConfig.cpp \
 	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
 	src/Log/Store.cpp \
@@ -70,6 +71,7 @@ OBJ = \
 	build/Raft/NodeAddress.o \
 	build/Raft/RaftState.o \
 	build/Raft/RaftApplier.o \
+	build/Raft/ClusterConfig.o \
 	build/storage/Index.o \
 	build/Log/Segment.o \
 	build/Log/Store.o \
