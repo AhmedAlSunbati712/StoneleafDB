@@ -122,7 +122,8 @@ StartupStatus setup_database(
     const std::string &db_file,
     KeyStore &key_store,
     Log &log,
-    TransactionManager &transaction_manager
+    TransactionManager &transaction_manager,
+    std::uint64_t &last_applied_raft_index
 ) {
     key_store.attach_transaction_manager(transaction_manager);
 
@@ -138,7 +139,7 @@ StartupStatus setup_database(
         // are ever opened - opening them first would let Pager cache header
         // state that redo's direct writes would then leave stale underneath it.
         std::unordered_map<TransactionId, Lsn> unresolved_transactions;
-        aries_recovery_redo(log, db_file, unresolved_transactions);
+        aries_recovery_redo(log, db_file, unresolved_transactions, last_applied_raft_index);
 
         if (key_store.open(db_file) != KeyStoreStatus::Success) {
             std::cerr << "[ERROR] Failed to open database: " << db_file << std::endl;
@@ -202,7 +203,11 @@ int main(int argc, char *argv[]) {
     LockManager lock_manager;
     TransactionManager transaction_manager(log, lock_manager, key_store);
 
-    StartupStatus status = setup_database(db_file, key_store, log, transaction_manager);
+    // Nothing consumes the watermark yet: RaftState is not constructed during
+    // startup until the apply loop is wired in.
+    std::uint64_t last_applied_raft_index = 0;
+    StartupStatus status = setup_database(
+        db_file, key_store, log, transaction_manager, last_applied_raft_index);
     if (status == StartupStatus::FAILED) {
         return 1;
     }

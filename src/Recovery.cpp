@@ -49,7 +49,8 @@ void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effect
 void aries_recovery_redo(
     Log& log,
     const std::string& db_file_name,
-    std::unordered_map<TransactionId, Lsn>& unresolved_transactions
+    std::unordered_map<TransactionId, Lsn>& unresolved_transactions,
+    std::uint64_t& last_applied_raft_index
 ) {
     // A genuinely fresh database has no database file yet - KeyStore::open
     // (called by the caller right after this) is what creates it. There is
@@ -95,6 +96,14 @@ void aries_recovery_redo(
                     auto it = unresolved_transactions.find(txn_id);
                     if (it != unresolved_transactions.end()) {
                         unresolved_transactions.erase(txn_id);
+                    }
+                    // Only a committed transaction counts toward last_applied:
+                    // one the undo pass rolls back never wrote this record.
+                    // Client transactions apply no Raft entry and carry 0.
+                    WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
+                    const std::uint64_t raft_index = std::get<CommitPayload>(payload).raft_index;
+                    if (raft_index > last_applied_raft_index) {
+                        last_applied_raft_index = raft_index;
                     }
                     current_offset += 1;
                     continue;
