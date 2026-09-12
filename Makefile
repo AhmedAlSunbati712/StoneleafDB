@@ -9,6 +9,7 @@ LIB = build/libstoneleafdb.a
 
 SRC = \
 	src/KeyStore.cpp \
+	src/Recovery.cpp \
 	src/containers/BTree.cpp \
 	src/containers/BTreeCursor.cpp \
 	src/containers/BTreeOperation.cpp \
@@ -51,6 +52,7 @@ SRC = \
 
 OBJ = \
 	build/KeyStore.o \
+	build/Recovery.o \
 	build/containers/BTree.o \
 	build/containers/BTreeCursor.o \
 	build/containers/BTreeOperation.o \
