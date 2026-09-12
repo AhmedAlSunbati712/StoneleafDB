@@ -47,11 +47,13 @@ class RaftState {
 
         // --- Term and vote --------------------------------------------------
         // The ONLY way to change the term. A vote is scoped to exactly one
-        // term, so raising the term always clears it in the same operation;
+        // term, so raising the term replaces it in the same operation;
         // exposing a bare term setter makes it possible to carry a stale vote
         // into a new term and grant a second vote in it, which allows two
-        // leaders in one term. Persists (new_term, no vote) before returning.
-        void advance_term(std::uint64_t new_term);   // asserts new_term > current_term
+        // leaders in one term. A new term also invalidates the prior leader.
+        // Persists (new_term, new_vote) before returning.
+        void advance_term(std::uint64_t new_term,
+                          std::optional<NodeAddress> new_vote = std::nullopt);
 
         // Grants the vote if we have not voted for a different candidate this
         // term and the candidate's log is at least as up to date as ours:
@@ -79,7 +81,8 @@ class RaftState {
         // election win, not once at construction: a server that leads in term
         // 5, steps down, and leads again in term 9 would otherwise reuse stale
         // progress from its first leadership, believe followers are further
-        // along than they are, and skip entries they never received.
+        // along than they are, and skip entries they never received. Records
+        // this node as the leader for the new leadership.
         void become_leader(std::uint64_t last_log_index);
 
         // If new_term > current_term, calls advance_term(), which persists.
@@ -212,7 +215,7 @@ class RaftState {
         std::uint64_t current_term_ = 0;
         std::optional<NodeAddress> voted_for_; // gRPC address of the node we voted for this term
 
-        std::optional<NodeAddress> leader_raft_address_; // gRPC address of the leader; nullopt until we hear from one this term
+        std::optional<NodeAddress> leader_raft_address_; // gRPC address of the leader; nullopt until we hear from one this term or become leader
         NodeAddress self_raft_address_;                   // gRPC address of this node; its identity
         std::vector<NodeAddress> peers_;                  // every other node's gRPC address, self excluded
 
