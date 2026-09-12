@@ -1,6 +1,7 @@
 #include <Raft/NodeAddress.h>
 #include <string_view>
 #include <charconv>
+#include <stdexcept>
 std::string NodeAddress::to_string() const {
     return host + ":" + std::to_string(port);
 }

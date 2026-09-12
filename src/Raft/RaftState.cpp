@@ -1,4 +1,8 @@
 #include <Raft/RaftState.h>
+
+#include <stdexcept>
+#include <utility>
+
 namespace {
     std::mt19937::result_type random_seed() {
         thread_local std::random_device device;
@@ -71,8 +75,12 @@ bool RaftState::grant_vote(const NodeAddress& candidate, std::uint64_t candidate
         return false;
     }
 
-    hard_state_store_.persist(current_term_, candidate.to_string());
-    voted_for_ = candidate;
+    // Re-granting the same vote needs no write: the durable state already says
+    // exactly this, so a retried RequestVote must not cost an fsync.
+    if (voted_for_ != candidate) {
+        hard_state_store_.persist(current_term_, candidate.to_string());
+        voted_for_ = candidate;
+    }
    
     // The caller resets the election timer on true return
     return true;
