@@ -97,8 +97,10 @@ std::size_t RaftApplier::apply_pending_batch() {
             }
         }
 
-        // Defer the sync: one fsync covers the whole batch below.
-        if (transaction_manager_.commit(transaction, Durability::Defer) != CommitStatus::Success) {
+        // Defer the sync: one fsync covers the whole batch below. The entry's
+        // index goes in the commit record, so recovery can rebuild
+        // last_applied from the WAL alone.
+        if (transaction_manager_.commit(transaction, Durability::Defer, index) != CommitStatus::Success) {
             throw std::runtime_error(describe(index, "commit failed"));
         }
         batch_commit_lsn = transaction->last_lsn();
