@@ -36,6 +36,15 @@ enum class KeyStoreStatus : std::uint8_t {
     TransactionNotFound
 };
 
+// Whether a write takes the logical key lock. Acquire is the only correct
+// choice for client transactions. Skip exists for the Raft apply loop: on a
+// leader the proposing session already holds the exclusive lock and is waiting
+// on last_applied, so taking it again would deadlock against that session.
+enum class Locking : std::uint8_t {
+    Acquire = 0,
+    Skip,
+};
+
 enum class KeyStoreCursorStatus : std::uint8_t {
     Success = 0,
     EndOfScan,
@@ -131,10 +140,12 @@ class KeyStore : public TransactionUndoExecutor {
         KeyStoreStatus put(
             const TransactionHandle &transaction,
             const Key &key,
-            const Value &value);
+            const Value &value,
+            Locking locking = Locking::Acquire);
         KeyStoreRemoveResult remove(
             const TransactionHandle &transaction,
-            const Key &key);
+            const Key &key,
+            Locking locking = Locking::Acquire);
 
         void attach_transaction_manager(TransactionManager &manager) noexcept;
 

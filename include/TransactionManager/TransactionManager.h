@@ -24,6 +24,16 @@ enum class CommitStatus : std::uint8_t {
     InvalidState,
 };
 
+// Whether commit() makes its commit record durable before returning. Sync is
+// the only correct choice for client transactions: commit() releases the
+// transaction's locks, so with Defer those locks would be released while the
+// commit is still not durable. Defer exists for the Raft apply loop, which
+// commits one transaction per entry and syncs once for the whole batch.
+enum class Durability : std::uint8_t {
+    Sync = 0,
+    Defer,
+};
+
 enum class AbortStatus : std::uint8_t {
     Success = 0,
     TransactionNotFound,
@@ -82,7 +92,8 @@ public:
 
     // Commit and abort own the complete lifecycle boundary. I/O and WAL
     // corruption failures continue to use the logger's exception convention.
-    CommitStatus commit(const TransactionHandle& transaction);
+    CommitStatus commit(const TransactionHandle& transaction,
+                        Durability durability = Durability::Sync);
     AbortStatus abort(const TransactionHandle& transaction, AbortReason reason);
 
     // Registers one complete blocker set through WaitForGraph::add_edges().
