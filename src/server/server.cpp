@@ -4,6 +4,11 @@
 #include <Log/WalPayloadCodec.h>
 #include <Log/WalRecords.h>
 #include <TransactionManager/TransactionManager.h>
+#include <Raft/ClusterConfig.h>
+#include <Raft/RaftApplier.h>
+#include <Raft/RaftHardStateStore.h>
+#include <Raft/RaftLog.h>
+#include <Raft/RaftState.h>
 #include <Recovery.h>
 #include <server/CommandServer.h>
 #include <DiskIO.h>
@@ -13,11 +18,15 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <span>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -27,10 +36,12 @@
 #include <filesystem>
 #include <Log/WalRecordCodec.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <mutex>
 
 namespace {
 
-constexpr std::uint16_t SERVER_PORT = 8080;
 enum class StartupStatus : std::uint8_t {
     SUCCESS = 0,
     FAILED,
@@ -158,7 +169,33 @@ StartupStatus setup_database(
     return StartupStatus::SUCCESS;
 }
 
-int create_listener() {
+// Shutdown is delivered to the accept loop through a self-pipe rather than by
+// interrupting accept(). A signal handler cannot safely do much, and neither
+// available shortcut works here: shutdown() on a LISTENING socket returns
+// ENOTCONN on macOS without waking accept(), and a handler installed through
+// std::signal leaves the syscall to be restarted. So the loop polls the
+// listener and the pipe together, and the handler just writes one byte.
+std::atomic<bool> shutdown_requested{false};
+std::atomic<int> shutdown_pipe_write{-1};
+
+void request_shutdown(int) {
+    shutdown_requested.store(true);
+    const int pipe_fd = shutdown_pipe_write.load();
+    if (pipe_fd >= 0) {
+        const char byte = 1;
+        (void)::write(pipe_fd, &byte, 1);   // write() is async-signal-safe
+    }
+}
+
+// Session threads must be joinable, or shutdown cannot wait for them to roll
+// back their transactions before storage closes.
+struct SessionRegistry {
+    std::mutex mutex;
+    std::vector<std::thread> threads;
+    std::unordered_set<int> open_sockets;
+};
+
+int create_listener(std::uint16_t port) {
     // Keep socket setup in one place so every startup failure closes the
     // partially initialized descriptor before returning to main.
     const int listener_fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -172,7 +209,7 @@ int create_listener() {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(SERVER_PORT);
+    address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (::bind(listener_fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0) {
@@ -191,11 +228,52 @@ int create_listener() {
 } // namespace
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <db-file>" << std::endl;
+    std::string db_file;
+    std::string config_path;
+    std::string self_text;
+    for (int arg = 1; arg < argc; ++arg) {
+        const std::string current = argv[arg];
+        if (current == "--config" && arg + 1 < argc) {
+            config_path = argv[++arg];
+        } else if (current == "--self" && arg + 1 < argc) {
+            self_text = argv[++arg];
+        } else if (db_file.empty() && !current.starts_with("--")) {
+            db_file = current;
+        } else {
+            db_file.clear();
+            break;
+        }
+    }
+
+    if (db_file.empty() || config_path.empty() || self_text.empty()) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <db-file> --config <cluster.conf> --self <host:port>" << std::endl;
         return 1;
     }
-    const std::string db_file = argv[1];
+
+    // --self is this node's DATABASE SERVER address; the cluster config maps it
+    // to the raft address that is this node's identity.
+    std::vector<ClusterMember> cluster;
+    NodeAddress self_client_address;
+    try {
+        cluster = parse_cluster_config(config_path);
+        self_client_address = NodeAddress::from_string(self_text);
+    } catch (const std::exception &error) {
+        std::cerr << "[ERROR] " << error.what() << std::endl;
+        return 1;
+    }
+
+    // RaftState enforces this too, but catching it here names the address and
+    // the column, which is what an operator needs to fix the mistake.
+    const bool self_in_cluster = std::any_of(
+        cluster.begin(), cluster.end(), [&](const ClusterMember &member) {
+            return member.database_server == self_client_address;
+        });
+    if (!self_in_cluster) {
+        std::cerr << "[ERROR] --self " << self_text
+                  << " matches no database_server address in " << config_path << std::endl;
+        return 1;
+    }
 
     KeyStore key_store;
     Config config = setup_config(db_file);
@@ -203,43 +281,177 @@ int main(int argc, char *argv[]) {
     LockManager lock_manager;
     TransactionManager transaction_manager(log, lock_manager, key_store);
 
-    // Nothing consumes the watermark yet: RaftState is not constructed during
-    // startup until the apply loop is wired in.
+    // 1. ARIES recovery: the database reaches a transactionally consistent
+    //    state, and reports how far the Raft log had been applied.
     std::uint64_t last_applied_raft_index = 0;
-    StartupStatus status = setup_database(
-        db_file, key_store, log, transaction_manager, last_applied_raft_index);
-    if (status == StartupStatus::FAILED) {
+    if (setup_database(db_file, key_store, log, transaction_manager,
+                       last_applied_raft_index) == StartupStatus::FAILED) {
         return 1;
     }
-    const int listener_fd = create_listener();
+
+    // 2. Open the Raft log and the persisted term/vote. Both live in <db>.raft;
+    //    RaftLog ignores files that are not segments.
+    const Config raft_config{
+        .max_index_bytes = 1000 * Index::ENTRY_SIZE,
+        .max_store_bytes = 16 * 1024 * 1024,
+        .initial_lsn = 1,
+    };
+    RaftLog raft_log(raft_config);
+    RaftHardStateStore hard_state;
+    std::unique_ptr<RaftState> raft_state;
+    try {
+        raft_log.open(db_file + ".raft");
+        hard_state.open(db_file + ".raft");
+
+        // 3. Raft state, seeded from recovery rather than from zero. Starts as
+        //    a Follower.
+        raft_state = std::make_unique<RaftState>(
+            cluster, self_client_address, hard_state, last_applied_raft_index);
+    } catch (const std::exception &error) {
+        std::cerr << "[ERROR] Failed to start Raft: " << error.what() << std::endl;
+        key_store.close();
+        return 1;
+    }
+
+    // 4. The apply loop, on every server regardless of role.
+    RaftApplier applier(*raft_state, raft_log, key_store, transaction_manager, log);
+    std::thread apply_thread([&applier] {
+        try {
+            applier.run();
+        } catch (const std::exception &error) {
+            // A committed entry must be applied on every node, so a node that
+            // cannot apply one must not keep running as if it had.
+            std::cerr << "[FATAL] Apply loop failed: " << error.what() << std::endl;
+            std::abort();
+        }
+    });
+
+    // Steps 5-7 of the startup order - the gRPC server, the replication threads
+    // and the election timer - do not exist yet. The node stays a Follower and
+    // nothing advances commit_index.
+
+    // 8. The client acceptor is last: clients must not connect before the node
+    //    can serve them.
+    const std::uint16_t client_port = self_client_address.port;
+    const int listener_fd = create_listener(client_port);
     if (listener_fd < 0) {
-        std::cerr << "[ERROR] Failed to listen on 127.0.0.1:" << SERVER_PORT << std::endl;
+        std::cerr << "[ERROR] Failed to listen on 127.0.0.1:" << client_port << std::endl;
+        {
+            std::lock_guard lock(raft_state->state_mutex);
+            raft_state->shutting_down = true;
+        }
+        raft_state->apply_cv.notify_all();
+        apply_thread.join();
+        raft_log.close();
+        key_store.close();
         return 1;
     }
+    int shutdown_pipe[2] = {-1, -1};
+    if (::pipe(shutdown_pipe) != 0) {
+        std::cerr << "[ERROR] Failed to create the shutdown pipe" << std::endl;
+        ::close(listener_fd);
+        {
+            std::lock_guard lock(raft_state->state_mutex);
+            raft_state->shutting_down = true;
+        }
+        raft_state->apply_cv.notify_all();
+        apply_thread.join();
+        raft_log.close();
+        key_store.close();
+        return 1;
+    }
+    ::fcntl(shutdown_pipe[0], F_SETFL, O_NONBLOCK);
+    ::fcntl(shutdown_pipe[1], F_SETFL, O_NONBLOCK);
+    shutdown_pipe_write.store(shutdown_pipe[1]);
 
-    std::cout << "Listening on 127.0.0.1:" << SERVER_PORT << std::endl;
+    std::signal(SIGINT, request_shutdown);
+    std::signal(SIGTERM, request_shutdown);
+    std::signal(SIGPIPE, SIG_IGN);
 
-    while (true) {
+    {
+        std::lock_guard lock(raft_state->state_mutex);
+        std::cout << "Raft address " << raft_state->self_raft_address().to_string()
+                  << ", last applied " << raft_state->last_applied() << std::endl;
+    }
+    std::cout << "Listening on 127.0.0.1:" << client_port << std::endl;
+
+    SessionRegistry sessions;
+    while (!shutdown_requested.load()) {
+        // Wait for either a client or the shutdown byte, so a signal that
+        // arrives between the check above and the wait is never missed.
+        pollfd waiting[2]{};
+        waiting[0] = {.fd = listener_fd, .events = POLLIN, .revents = 0};
+        waiting[1] = {.fd = shutdown_pipe[0], .events = POLLIN, .revents = 0};
+        if (::poll(waiting, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "[ERROR] Failed to wait for connections" << std::endl;
+            break;
+        }
+        if (waiting[1].revents != 0) break;            // shutdown requested
+        if ((waiting[0].revents & POLLIN) == 0) continue;
+
         sockaddr_in client_address{};
         socklen_t client_address_size = sizeof(client_address);
-        const int socket_fd = ::accept(listener_fd, reinterpret_cast<sockaddr *>(&client_address), &client_address_size);
+        const int socket_fd = ::accept(
+            listener_fd, reinterpret_cast<sockaddr *>(&client_address), &client_address_size);
         if (socket_fd < 0) {
+            if (shutdown_requested.load()) break;
             if (errno == EINTR) continue;
             std::cerr << "[ERROR] Failed to accept client connection" << std::endl;
             continue;
         }
 
-        // The dispatcher owns the accepted descriptor. Its executor threads
-        // remain joined, while this connection-level thread runs independently.
         try {
-            std::thread dispatcher(
-                CommandServer::serve_connection,
-                socket_fd,
-                std::ref(key_store),
-                std::ref(transaction_manager));
-            dispatcher.detach();
+            std::lock_guard lock(sessions.mutex);
+            sessions.open_sockets.insert(socket_fd);
+            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager] {
+                CommandServer::serve_connection(socket_fd, key_store, transaction_manager);
+                std::lock_guard lock(sessions.mutex);
+                sessions.open_sockets.erase(socket_fd);
+            });
         } catch (...) {
             ::close(socket_fd);
         }
     }
+
+    // --- Shutdown, in the order the design requires ---------------------------
+    // 1. Stop accepting. The signal handler already shut the listener down.
+    ::close(listener_fd);
+    shutdown_pipe_write.store(-1);
+    ::close(shutdown_pipe[0]);
+    ::close(shutdown_pipe[1]);
+    std::cout << "Shutting down" << std::endl;
+
+    // 2. Wake every parked thread. A thread waiting on a condition variable
+    //    cannot be stopped any other way.
+    {
+        std::lock_guard lock(raft_state->state_mutex);
+        raft_state->shutting_down = true;
+    }
+    raft_state->election_cv.notify_all();
+    raft_state->replication_cv.notify_all();
+    raft_state->apply_cv.notify_all();
+    raft_state->applied_cv.notify_all();
+
+    // 3. Sessions: wake any thread blocked reading its socket, then join. The
+    //    acceptor has stopped, so no descriptor is being handed out any more.
+    {
+        std::lock_guard lock(sessions.mutex);
+        for (const int socket_fd : sessions.open_sockets) ::shutdown(socket_fd, SHUT_RDWR);
+    }
+    for (std::thread &session : sessions.threads) {
+        if (session.joinable()) session.join();
+    }
+
+    // 4. The apply loop finishes its current batch before returning.
+    apply_thread.join();
+
+    // 5. Storage last, once nothing is running against it.
+    raft_log.close();
+    if (key_store.close() != KeyStoreStatus::Success) {
+        std::cerr << "[ERROR] Failed to close the database cleanly" << std::endl;
+        return 1;
+    }
+
+    return 0;
 }
