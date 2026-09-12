@@ -324,7 +324,8 @@ KeyStoreGetResult KeyStore::get(
 KeyStoreStatus KeyStore::put(
     const TransactionHandle &transaction,
     const Key &key,
-    const Value &value
+    const Value &value,
+    Locking locking
 ) {
     if (!is_open) return KeyStoreStatus::NotOpen;
     if (!transaction_manager || !transaction) return KeyStoreStatus::TransactionNotFound;
@@ -334,16 +335,18 @@ KeyStoreStatus KeyStore::put(
     // Writers take the exclusive logical key lock immediately. This avoids a
     // read-then-promote cycle inside KeyStore while still allowing replacement
     // undo to read the old value under the exclusive lock.
-    LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
-        transaction->id(),
-        key);
-    if (lock_status == LockManagerStatus::Deadlock) return KeyStoreStatus::Deadlock;
-    if (lock_status == LockManagerStatus::TransactionNotFound) {
-        return KeyStoreStatus::TransactionNotFound;
-    }
-    if (lock_status != LockManagerStatus::Success &&
-        lock_status != LockManagerStatus::TxnHoldsExclusive) {
-        return KeyStoreStatus::WriteFailed;
+    if (locking == Locking::Acquire) {
+        LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
+            transaction->id(),
+            key);
+        if (lock_status == LockManagerStatus::Deadlock) return KeyStoreStatus::Deadlock;
+        if (lock_status == LockManagerStatus::TransactionNotFound) {
+            return KeyStoreStatus::TransactionNotFound;
+        }
+        if (lock_status != LockManagerStatus::Success &&
+            lock_status != LockManagerStatus::TxnHoldsExclusive) {
+            return KeyStoreStatus::WriteFailed;
+        }
     }
 
     BTreeGetStatus previous = tree.get(key);
@@ -372,7 +375,8 @@ KeyStoreStatus KeyStore::put(
 
 KeyStoreRemoveResult KeyStore::remove(
     const TransactionHandle &transaction,
-    const Key &key
+    const Key &key,
+    Locking locking
 ) {
     KeyStoreRemoveResult result{};
     if (!is_open) {
@@ -388,21 +392,23 @@ KeyStoreRemoveResult KeyStore::remove(
         return result;
     }
 
-    LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
-        transaction->id(),
-        key);
-    if (lock_status == LockManagerStatus::Deadlock) {
-        result.status = KeyStoreStatus::Deadlock;
-        return result;
-    }
-    if (lock_status == LockManagerStatus::TransactionNotFound) {
-        result.status = KeyStoreStatus::TransactionNotFound;
-        return result;
-    }
-    if (lock_status != LockManagerStatus::Success &&
-        lock_status != LockManagerStatus::TxnHoldsExclusive) {
-        result.status = KeyStoreStatus::WriteFailed;
-        return result;
+    if (locking == Locking::Acquire) {
+        LockManagerStatus lock_status = transaction_manager->lock_manager().lock_exclusive(
+            transaction->id(),
+            key);
+        if (lock_status == LockManagerStatus::Deadlock) {
+            result.status = KeyStoreStatus::Deadlock;
+            return result;
+        }
+        if (lock_status == LockManagerStatus::TransactionNotFound) {
+            result.status = KeyStoreStatus::TransactionNotFound;
+            return result;
+        }
+        if (lock_status != LockManagerStatus::Success &&
+            lock_status != LockManagerStatus::TxnHoldsExclusive) {
+            result.status = KeyStoreStatus::WriteFailed;
+            return result;
+        }
     }
 
     BTreeGetStatus previous = tree.get(key);
