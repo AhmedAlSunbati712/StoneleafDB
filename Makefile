@@ -134,7 +134,8 @@ SERVER_SRC = \
         src/server/CommandServer.cpp \
         src/Raft/RaftProtoCodec.cpp \
         src/Raft/RaftServiceImpl.cpp \
-        src/Raft/RaftPeerClients.cpp
+        src/Raft/RaftPeerClients.cpp \
+        src/Raft/RaftElection.cpp
 SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
 SERVER_BIN = build/stoneleaf-server
 
@@ -224,10 +225,12 @@ $(GEN_DIR)/raft.pb.h $(GEN_DIR)/raft.grpc.pb.h: $(GEN_DIR)/raft.pb.cc ;
 build/Raft/RaftProtoCodec.o: $(GEN_DIR)/raft.pb.h
 build/Raft/RaftServiceImpl.o: $(GEN_DIR)/raft.grpc.pb.h
 build/Raft/RaftPeerClients.o: $(GEN_DIR)/raft.grpc.pb.h
+build/Raft/RaftElection.o: $(GEN_DIR)/raft.grpc.pb.h
 build/server/server.o: $(GEN_DIR)/raft.grpc.pb.h
 build/tests/unit/RaftProtoCodec_test.o: $(GEN_DIR)/raft.pb.h
 build/tests/integration/RaftService_test.o: $(GEN_DIR)/raft.grpc.pb.h
 build/tests/integration/RaftTransport_test.o: $(GEN_DIR)/raft.grpc.pb.h
+build/tests/integration/RaftElection_test.o: $(GEN_DIR)/raft.grpc.pb.h
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.cc
 	$(CXX) --std=c++23 -w $(GRPC_CXXFLAGS) -I$(GEN_DIR) -c $< -o $@
@@ -268,6 +271,12 @@ build/tests/integration/RaftService_test: build/tests/integration/RaftService_te
 # Stands up real gRPC servers, so it needs the peer clients too.
 build/tests/integration/RaftTransport_test: CXXFLAGS += -pthread
 build/tests/integration/RaftTransport_test: build/tests/integration/RaftTransport_test.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
+
+# Elections need the whole plane: the handlers to answer, the clients to ask.
+build/tests/integration/RaftElection_test: CXXFLAGS += -pthread
+build/tests/integration/RaftElection_test: build/tests/integration/RaftElection_test.o build/Raft/RaftElection.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
 
