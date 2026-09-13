@@ -202,6 +202,15 @@ class RaftState {
         static constexpr auto ELECTION_TIMEOUT_MAX = std::chrono::milliseconds(300);
         static constexpr auto HEARTBEAT_INTERVAL   = std::chrono::milliseconds(50);
 
+        // How long a proposing session waits for its entry to apply before it
+        // gives up and answers Unknown. Generous relative to the election
+        // timeouts on purpose: an entry proposed just before a leader change is
+        // usually resolved - committed by the next leader, or truncated - within
+        // a heartbeat or two of the new leadership, and reporting Unknown for
+        // something that was about to become definite is the worst answer a
+        // client without deduplication can receive.
+        static constexpr auto COMMIT_TIMEOUT = std::chrono::milliseconds(5000);
+
     private:
         RaftHardStateStore& hard_state_store_;
 

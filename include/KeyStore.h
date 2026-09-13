@@ -33,7 +33,17 @@ enum class KeyStoreStatus : std::uint8_t {
     ReadFailed,
     DecodeFailed,
     Deadlock,
-    TransactionNotFound
+    TransactionNotFound,
+    // Appended, like the block above: these values go on the wire in the
+    // command protocol, so inserting anywhere else would silently reinterpret
+    // every existing status.
+    //
+    // NotLeader: this node cannot accept the write; the client must find the
+    // leader. CommitUnknown: the entry was proposed but its fate was not
+    // established before COMMIT_TIMEOUT - it may still commit, so unlike a
+    // failure it is NOT safe to blindly retry.
+    NotLeader,
+    CommitUnknown
 };
 
 // Whether a write takes the logical key lock. Acquire is the only correct

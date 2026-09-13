@@ -42,7 +42,10 @@ class Connection {
                 CommandServer::serve_connection,
                 sockets[1],
                 std::ref(key_store),
-                std::ref(transaction_manager));
+                std::ref(transaction_manager),
+                // No proposer: this fixture has no cluster, so writes go
+                // straight through KeyStore exactly as they always have.
+                nullptr);
         }
 
         ~Connection() {
@@ -83,7 +86,10 @@ class RawConnection {
                 CommandServer::serve_connection,
                 sockets[1],
                 std::ref(key_store),
-                std::ref(transaction_manager));
+                std::ref(transaction_manager),
+                // No proposer: this fixture has no cluster, so writes go
+                // straight through KeyStore exactly as they always have.
+                nullptr);
         }
 
         ~RawConnection() {

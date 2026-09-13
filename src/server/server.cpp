@@ -10,6 +10,8 @@
 #include <Raft/RaftElection.h>
 #include <Raft/RaftLog.h>
 #include <Raft/RaftPeerClients.h>
+#include <Raft/RaftProposer.h>
+#include <Raft/RaftReplicator.h>
 #include <Raft/RaftServiceImpl.h>
 #include <Raft/RaftState.h>
 #include <Recovery.h>
@@ -362,9 +364,35 @@ int main(int argc, char *argv[]) {
     std::cout << "Serving Raft RPCs on 0.0.0.0:" << self_raft_address.port
               << " as " << self_raft_address.to_string() << std::endl;
 
-    // Step 6 of the startup order - the replication threads - does not exist
-    // yet, so a node that wins below leads without replicating and its peers
-    // will depose it on their next timeout. Expected until that lands.
+    // 6. The replication threads, one per peer, on every server. They park
+    //    immediately - we start as a follower - and the election thread wakes
+    //    them the moment this node wins. Created once and parked rather than
+    //    spawned on promotion: joining them in become_follower() would block a
+    //    step-down on an in-flight RPC to an unreachable peer.
+    std::vector<std::unique_ptr<RaftReplicator>> replicators;
+    std::vector<std::thread> replication_threads;
+    replicators.reserve(peers.size());
+    replication_threads.reserve(peers.size());
+    for (const NodeAddress &peer : peers) {
+        replicators.push_back(std::make_unique<RaftReplicator>(
+            *raft_state, raft_log, peer_clients, peer));
+        RaftReplicator &replicator = *replicators.back();
+        replication_threads.emplace_back([&replicator, peer] {
+            try {
+                replicator.run();
+            } catch (const std::exception &error) {
+                // An unreachable peer is absorbed inside the loop; reaching here
+                // means something structural failed. The node can still lead for
+                // its other peers and can still follow, so this is not fatal.
+                std::cerr << "[ERROR] Replication to " << peer.to_string()
+                          << " stopped: " << error.what() << std::endl;
+            }
+        });
+    }
+
+    // The session side of replication: turns a committed transaction's buffered
+    // writes into a Raft entry and waits for it to apply.
+    RaftProposer proposer(*raft_state, raft_log);
 
     // 7. The election timer. LAST of the Raft threads on purpose: this is the
     //    first moment the node can campaign, so nothing a campaign depends on -
@@ -393,8 +421,12 @@ int main(int argc, char *argv[]) {
         }
         raft_state->apply_cv.notify_all();
         raft_state->election_cv.notify_all();
-        // Same order as the normal path: the outbound caller stops first, then
-        // our own server, and only then the log it was writing to.
+        raft_state->replication_cv.notify_all();
+        // Same order as the normal path: the outbound callers stop first, then
+        // our own server, and only then the log they were writing to.
+        for (std::thread &replication : replication_threads) {
+            if (replication.joinable()) replication.join();
+        }
         election_thread.join();
         raft_server->Shutdown();
         raft_server->Wait();
@@ -413,8 +445,12 @@ int main(int argc, char *argv[]) {
         }
         raft_state->apply_cv.notify_all();
         raft_state->election_cv.notify_all();
-        // Same order as the normal path: the outbound caller stops first, then
-        // our own server, and only then the log it was writing to.
+        raft_state->replication_cv.notify_all();
+        // Same order as the normal path: the outbound callers stop first, then
+        // our own server, and only then the log they were writing to.
+        for (std::thread &replication : replication_threads) {
+            if (replication.joinable()) replication.join();
+        }
         election_thread.join();
         raft_server->Shutdown();
         raft_server->Wait();
@@ -467,8 +503,8 @@ int main(int argc, char *argv[]) {
         try {
             std::lock_guard lock(sessions.mutex);
             sessions.open_sockets.insert(socket_fd);
-            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager] {
-                CommandServer::serve_connection(socket_fd, key_store, transaction_manager);
+            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager, &proposer] {
+                CommandServer::serve_connection(socket_fd, key_store, transaction_manager, &proposer);
                 std::lock_guard lock(sessions.mutex);
                 sessions.open_sockets.erase(socket_fd);
             });
@@ -506,23 +542,27 @@ int main(int argc, char *argv[]) {
         if (session.joinable()) session.join();
     }
 
-    // 4. Join the election thread. It goes BEFORE the RPC server stops because
-    //    it is the one still making outbound calls: shutting our own server
-    //    first would leave it campaigning at peers that can no longer answer.
-    //    A campaign in flight joins its own voters first, bounded by the RPC
-    //    deadline.
+    // 4. Join the replication threads. They are parked or between RPCs, so this
+    //    is bounded by the RPC deadline.
+    for (std::thread &replication : replication_threads) {
+        if (replication.joinable()) replication.join();
+    }
+
+    // 5. Join the election thread. Both outbound callers stop BEFORE the RPC
+    //    server does: shutting our own server first would leave them talking to
+    //    peers that can no longer answer.
     election_thread.join();
 
-    // 5. Stop serving Raft RPCs. Shutdown() returns only once every in-flight
+    // 6. Stop serving Raft RPCs. Shutdown() returns only once every in-flight
     //    handler has returned, which is what makes closing RaftLog below safe -
     //    the AppendEntries handler appends to it and truncates it.
     raft_server->Shutdown();
     raft_server->Wait();
 
-    // 6. The apply loop finishes its current batch before returning.
+    // 7. The apply loop finishes its current batch before returning.
     apply_thread.join();
 
-    // 7. Storage last, once nothing is running against it.
+    // 8. Storage last, once nothing is running against it.
     raft_log.close();
     if (key_store.close() != KeyStoreStatus::Success) {
         std::cerr << "[ERROR] Failed to close the database cleanly" << std::endl;
