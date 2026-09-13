@@ -117,7 +117,10 @@ INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integrati
 
 SERVER_SRC = \
         src/server/server.cpp \
-        src/server/CommandServer.cpp
+        src/server/CommandServer.cpp \
+        src/Raft/RaftProtoCodec.cpp \
+        src/Raft/RaftServiceImpl.cpp \
+        src/Raft/RaftPeerClients.cpp
 SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
 SERVER_BIN = build/stoneleaf-server
 
@@ -144,9 +147,12 @@ benchmark-run: $(BENCHMARK_BIN)
 	./$(BENCHMARK_BIN)
 
 $(SERVER_BIN): CXXFLAGS += -pthread
-$(SERVER_BIN): $(SERVER_OBJ) $(LIB)
+# The Raft RPC sources live here rather than in $(LIB) on purpose: putting them
+# in the library would force protobuf and gRPC onto every test binary that links
+# it. The server is the only thing that needs them.
+$(SERVER_BIN): $(SERVER_OBJ) $(PROTO_OBJ) $(LIB)
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) $(GRPC_LDLIBS)
 
 build/%.o: src/%.cpp
 	mkdir -p $(dir $@)
@@ -189,7 +195,12 @@ $(GEN_DIR)/raft.pb.h $(GEN_DIR)/raft.grpc.pb.h: $(GEN_DIR)/raft.pb.cc ;
 # a fresh clone - or any build after make clean, which deletes build/gen -
 # compiles the codec before the header exists.
 build/Raft/RaftProtoCodec.o: $(GEN_DIR)/raft.pb.h
+build/Raft/RaftServiceImpl.o: $(GEN_DIR)/raft.grpc.pb.h
+build/Raft/RaftPeerClients.o: $(GEN_DIR)/raft.grpc.pb.h
+build/server/server.o: $(GEN_DIR)/raft.grpc.pb.h
 build/tests/unit/RaftProtoCodec_test.o: $(GEN_DIR)/raft.pb.h
+build/tests/integration/RaftService_test.o: $(GEN_DIR)/raft.grpc.pb.h
+build/tests/integration/RaftTransport_test.o: $(GEN_DIR)/raft.grpc.pb.h
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.cc
 	$(CXX) --std=c++23 -w $(GRPC_CXXFLAGS) -I$(GEN_DIR) -c $< -o $@
@@ -216,6 +227,22 @@ build/tests/integration/RaftApplier_test: LDLIBS += -pthread
 build/tests/unit/RaftProtoCodec_test: build/tests/unit/RaftProtoCodec_test.o build/Raft/RaftProtoCodec.o $(GEN_DIR)/raft.pb.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS)
+
+# The RaftService::Service base class lives in raft.grpc.pb.o, the messages in
+# raft.pb.o, and the handlers convert through the codec. Explicit rather than
+# left to the pattern rule above, which links only $(LIB) - and, as with the
+# codec, none of this is in $(LIB) until the server actually starts a gRPC
+# server. -pthread because RaftState's mutex and condition variables are live.
+build/tests/integration/RaftService_test: CXXFLAGS += -pthread
+build/tests/integration/RaftService_test: build/tests/integration/RaftService_test.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
+
+# Stands up real gRPC servers, so it needs the peer clients too.
+build/tests/integration/RaftTransport_test: CXXFLAGS += -pthread
+build/tests/integration/RaftTransport_test: build/tests/integration/RaftTransport_test.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
 
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
