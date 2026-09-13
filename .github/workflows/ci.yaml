@@ -17,7 +17,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libgtest-dev
+          # protobuf-compiler provides protoc and protobuf-compiler-grpc the
+          # grpc_cpp_plugin that protoc invokes for --grpc_out; the -dev packages
+          # and pkg-config are what the Makefile discovers the flags through.
+          sudo apt-get install -y g++ make libgtest-dev pkg-config \
+            protobuf-compiler protobuf-compiler-grpc \
+            libprotobuf-dev libgrpc++-dev
+
+      - name: Show toolchain versions
+        run: |
+          g++ --version | head -1
+          protoc --version
+          pkg-config --modversion grpc++ protobuf
 
       - name: Build
         run: make all

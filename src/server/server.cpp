@@ -8,6 +8,8 @@
 #include <Raft/RaftApplier.h>
 #include <Raft/RaftHardStateStore.h>
 #include <Raft/RaftLog.h>
+#include <Raft/RaftPeerClients.h>
+#include <Raft/RaftServiceImpl.h>
 #include <Raft/RaftState.h>
 #include <Recovery.h>
 #include <server/CommandServer.h>
@@ -326,9 +328,42 @@ int main(int argc, char *argv[]) {
         }
     });
 
-    // Steps 5-7 of the startup order - the gRPC server, the replication threads
-    // and the election timer - do not exist yet. The node stays a Follower and
-    // nothing advances commit_index.
+    // 5. The Raft RPC plane, before anything that could campaign: a node that
+    //    campaigns before it can answer its peers cannot win.
+    NodeAddress self_raft_address;
+    std::vector<NodeAddress> peers;
+    {
+        std::lock_guard lock(raft_state->state_mutex);
+        self_raft_address = raft_state->self_raft_address();
+        peers = raft_state->peers();
+    }
+
+    RaftServiceImpl raft_service(*raft_state, raft_log);
+    std::unique_ptr<grpc::Server> raft_server =
+        RaftRpc::start_server(self_raft_address.port, raft_service);
+    if (!raft_server) {
+        std::cerr << "[ERROR] Failed to listen for Raft RPCs on port "
+                  << self_raft_address.port << std::endl;
+        {
+            std::lock_guard lock(raft_state->state_mutex);
+            raft_state->shutting_down = true;
+        }
+        raft_state->apply_cv.notify_all();
+        apply_thread.join();
+        raft_log.close();
+        key_store.close();
+        return 1;
+    }
+
+    // The outbound half. Channels connect lazily, so every peer being down right
+    // now - the normal case at cluster boot - cannot fail startup.
+    RaftPeerClients peer_clients(peers);
+    std::cout << "Serving Raft RPCs on 0.0.0.0:" << self_raft_address.port
+              << " as " << self_raft_address.to_string() << std::endl;
+
+    // Steps 6-7 of the startup order - the replication threads and the election
+    // timer - do not exist yet. The node stays a Follower and nothing advances
+    // commit_index on its own, though a live leader can now reach us.
 
     // 8. The client acceptor is last: clients must not connect before the node
     //    can serve them.
@@ -341,6 +376,9 @@ int main(int argc, char *argv[]) {
             raft_state->shutting_down = true;
         }
         raft_state->apply_cv.notify_all();
+        // Before closing the Raft log: a handler in flight is still writing to it.
+        raft_server->Shutdown();
+        raft_server->Wait();
         apply_thread.join();
         raft_log.close();
         key_store.close();
@@ -355,6 +393,9 @@ int main(int argc, char *argv[]) {
             raft_state->shutting_down = true;
         }
         raft_state->apply_cv.notify_all();
+        // Before closing the Raft log: a handler in flight is still writing to it.
+        raft_server->Shutdown();
+        raft_server->Wait();
         apply_thread.join();
         raft_log.close();
         key_store.close();
@@ -443,10 +484,18 @@ int main(int argc, char *argv[]) {
         if (session.joinable()) session.join();
     }
 
-    // 4. The apply loop finishes its current batch before returning.
+    // 4. Stop serving Raft RPCs. Shutdown() returns only once every in-flight
+    //    handler has returned, which is what makes closing RaftLog below safe -
+    //    the AppendEntries handler appends to it and truncates it. Were the
+    //    replication threads already running they would be joined first, so that
+    //    our own server outlives the calls we are still making.
+    raft_server->Shutdown();
+    raft_server->Wait();
+
+    // 5. The apply loop finishes its current batch before returning.
     apply_thread.join();
 
-    // 5. Storage last, once nothing is running against it.
+    // 6. Storage last, once nothing is running against it.
     raft_log.close();
     if (key_store.close() != KeyStoreStatus::Success) {
         std::cerr << "[ERROR] Failed to close the database cleanly" << std::endl;

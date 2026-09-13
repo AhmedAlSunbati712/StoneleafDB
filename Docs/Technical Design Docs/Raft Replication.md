@@ -676,11 +676,18 @@ on AppendEntries(term, leader, prev_index, prev_term, entries, leader_commit):
     if new_from < len(entries):
         RaftLog.append_from_leader(prev_index + 1 + new_from, entries[new_from:])
 
-    RaftLog.sync_through(prev_index + len(entries))    // durable BEFORE replying success
+    // The tail we have just confirmed matches the leader. It is 0 for exactly
+    // one case - a heartbeat to a still-empty log - and sync_through rejects
+    // index 0, so the call is guarded rather than unconditional.
+    last_new <- prev_index + len(entries)
+    if last_new > 0:
+        RaftLog.sync_through(last_new)         // durable BEFORE replying success
 
-    // 5. Advance commit_index, bounded by what we actually hold.
-    if leader_commit > commit_index:
-        commit_index <- min(leader_commit, prev_index + len(entries))
+    // 5. Advance commit_index, bounded by what we actually hold. The BOUND is
+    //    what has to clear commit_index, not leader_commit - see below.
+    commit_bound <- min(leader_commit, last_new)
+    if commit_bound > commit_index:
+        commit_index <- commit_bound
         apply_cv.notify_one()
 
     return {current_term, success = true}
@@ -692,7 +699,11 @@ on AppendEntries(term, leader, prev_index, prev_term, entries, leader_commit):
 
 **The `min()` in step 5 matters.** `leader_commit` can be ahead of what this follower holds, because the leader commits as soon as a *majority* has an entry and this follower may not be in that majority. Taking the minimum keeps `commit_index` from running past the end of our log and handing the apply loop an index it cannot read.
 
+**And the comparison is against the bound, not `leader_commit`.** `commit_index` only ever moves forward — `set_commit_index()` asserts it. A leader probing backwards after a failed consistency check sends a low `prev_index` while still carrying a high `leader_commit`, so the two are independent: a follower holding 100 entries with `commit_index = 50`, receiving a heartbeat with `prev_index = 10` and `leader_commit = 60`, passes a `leader_commit > commit_index` test and then computes a bound of 10. Testing `leader_commit` admits that and trips the assertion; testing the bound rejects it and leaves `commit_index` alone, which is correct — learning the leader's commit point says nothing about entries we have just been told we do not have.
+
 **Durability precedes the reply**, per *Durability* above: reply `success = true` before `sync_through()` returns and the leader may count us toward a majority for an entry we lose in a crash. Truncation is covered by the same sync.
+
+**But the sync is guarded, because `sync_through()` rejects index 0.** Raft indexes start at 1, so `sync_through(0)` is a caller bug and throws `std::out_of_range`. `prev_index + len(entries)` is 0 only when `prev_index` is 0 and `entries` is empty: a heartbeat to a follower whose log is still empty, which is exactly what a freshly elected leader sends before any client write. Unguarded, that throws out of the RPC handler on the first heartbeat of every new cluster. Nothing needs syncing in that case — there is nothing in the log to make durable.
 
 **A deliberate exception to the locking rule.** This handler holds `state_mutex` across `sync_through()`, which is I/O — one of the two places the rule under *Locking discipline* is broken on purpose (the other is persisting term and vote). Releasing the lock between the state decision and the log write would let a concurrent `AppendEntries` from a different term interleave its truncation with ours, and the check would no longer mean anything by the time we acted on it. The cost is acceptable because a follower has nothing else to do: its sessions are idle, other `AppendEntries` must serialize anyway, and the election timer was just reset so it cannot fire during the write. Lock ordering is still `state_mutex` → `raft_log_mutex`, which is exactly the inversion this handler would otherwise introduce by consulting the log before taking Raft state.
 
@@ -1222,7 +1233,11 @@ Order matters in two places, so this is a sequence and not a set:
 2. Open `RaftLog` and `RaftHardStateStore`.
 3. Construct `RaftState` from the cluster config, `--self`, and the open `RaftHardStateStore` (it loads `current_term` and `voted_for` itself), seeding `last_applied` and `commit_index` per *Seeding `commit_index` and `last_applied` on startup*. State is `Follower`.
 4. Start the apply loop.
-5. Start the RPC server. **Before step 7** — a server that campaigns before it can receive `RequestVote` replies cannot win, and worse, cannot answer its peers.
+5. Start the RPC server, and build the outbound channels and stubs. **Before step 7** — a server that campaigns before it can receive `RequestVote` replies cannot win, and worse, cannot answer its peers.
+   - Bind `0.0.0.0:<raft port>`, not the configured host: peers on other hosts have to reach us, while the address we are *known* by stays the config spelling, which is what `is_peer()` matches against.
+   - Raise the message-size limit on the server **and** on every channel. gRPC enforces its 4 MiB default independently at each end, so raising it only on the sender turns an oversized `AppendEntries` into a peer-side `RESOURCE_EXHAUSTED` instead of a larger message.
+   - One channel and stub per peer, created here and reused. Channels connect lazily and reconnect themselves, so a peer that is down does not fail startup — which matters because at cluster boot every peer is down.
+   - The RPC deadline belongs between the heartbeat interval and the minimum election timeout: above the former so a slow heartbeat is not cancelled and retried while still in flight, below the latter so a thread blocked on a dead peer is released before that silence can cost an election.
 6. Start the replication threads. They park immediately, since we begin as a follower.
 7. Start the election timer. This is the first moment the server can campaign, so nothing that a campaign depends on may start after it.
 8. Start the connection acceptor. **Last** — clients must not connect before the node can serve them.
@@ -1235,8 +1250,9 @@ Shutdown needs a `shutting_down` flag on `RaftState` that **every** wait predica
 3. Session threads wake. Any parked in `await_commit` return `Unknown` — the entry may well still commit elsewhere, and that is the honest answer. Roll back their open transactions and release their locks.
 4. Join the replication threads. They are parked or between RPCs, so this is bounded.
 5. Join the election thread.
-6. Let the apply loop **finish its current batch and `flush wal log`** before exiting. Cutting it off mid-batch is safe — the entries are still in the Raft log and replay on restart — but finishing avoids redoing the work.
-7. Close `RaftLog`, then the WAL and `KeyStore`.
+6. **Stop the RPC server.** `Shutdown()` returns only once every in-flight handler has returned, which is exactly what makes step 8 safe: the `AppendEntries` handler appends to `RaftLog` and truncates it, so closing the log with a handler still running is a write to a closed log. It comes after the replication threads because those threads are the ones still issuing outbound calls; stopping our own server first would leave them racing against peers that can no longer answer.
+7. Let the apply loop **finish its current batch and `flush wal log`** before exiting. Cutting it off mid-batch is safe — the entries are still in the Raft log and replay on restart — but finishing avoids redoing the work.
+8. Close `RaftLog`, then the WAL and `KeyStore`.
 
 ### Failure handling
 Threads differ in how they treat errors, and the difference is deliberate:
@@ -1246,4 +1262,5 @@ Threads differ in how they treat errors, and the difference is deliberate:
 - **Session threads absorb their own errors.** A client disconnecting mid-transaction aborts it and releases its locks, as `serve_connection` already does today.
 
 ## Gaps not Filled yet
+- **Transport security**: every server uses `InsecureServerCredentials` and every channel `InsecureChannelCredentials`, so Raft traffic is unauthenticated and in the clear. Any host that can reach a raft port can impersonate a peer — append entries, or win an election. `is_peer()` checks the *claimed* address in the request body, which is not authentication. Mutual TLS with a shared cluster CA is the intended fix, and it needs a credentials source in the cluster config.
 - **Commit Status wire encoding**: `CommitResult { Success, Failed, Unknown }` and where each value is produced are now designed under *Returning the commit result*. What remains is purely the wire format: how the three values plus an optional redirect to the leader's client address (`leader_client_address()`, never the Raft `leader_raft_address`) are encoded in the client response, alongside the existing size-prefixed command protocol.

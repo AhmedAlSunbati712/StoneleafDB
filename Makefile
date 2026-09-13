@@ -1,5 +1,29 @@
+PROTO_DIR = proto
+GEN_DIR = build/gen
+
+PKG_CONFIG ?= pkg-config
+
+GRPC_CXXFLAGS := $(shell $(PKG_CONFIG) --cflags grpc++ protobuf)
+GRPC_LDLIBS   := $(shell $(PKG_CONFIG) --libs   grpc++ protobuf)
+
+# protoc has to match the protobuf headers we compile against: generated code
+# carries a version assertion, so a 3.x protoc against a 36.x runtime does not
+# merely warn, it fails to compile. That rules out taking whatever protoc comes
+# first on PATH - on a dev box with conda or a vendored toolchain installed, that
+# is routinely a different major version from the one pkg-config reports.
+#
+# So resolve each tool from the prefix of the library it must agree with, and
+# fall back to PATH only when that prefix has no binary (which is how a
+# distro-packaged layout with a separate -compiler package behaves). Both stay
+# overridable from the command line or the environment.
+PROTOBUF_PREFIX := $(shell $(PKG_CONFIG) --variable=prefix protobuf 2>/dev/null)
+GRPC_PREFIX     := $(shell $(PKG_CONFIG) --variable=prefix grpc++ 2>/dev/null)
+
+PROTOC ?= $(firstword $(wildcard $(PROTOBUF_PREFIX)/bin/protoc) protoc)
+GRPC_CPP_PLUGIN ?= $(firstword $(wildcard $(GRPC_PREFIX)/bin/grpc_cpp_plugin) grpc_cpp_plugin)
+
 CXX = g++
-CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
+CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -I build/gen $(GRPC_CXXFLAGS) -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lgtest -lgtest_main
 AR = ar
@@ -95,6 +119,8 @@ OBJ = \
 	build/DBHeaderCodec.o \
 	build/V2PageCodec.o
 
+PROTO_OBJ = $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o
+
 UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))
 UNIT_TEST_BIN := $(patsubst tests/unit/%.cpp,build/tests/unit/%,$(UNIT_TEST_SRC))
@@ -105,7 +131,10 @@ INTEGRATION_TEST_BIN := $(patsubst tests/integration/%.cpp,build/tests/integrati
 
 SERVER_SRC = \
         src/server/server.cpp \
-        src/server/CommandServer.cpp
+        src/server/CommandServer.cpp \
+        src/Raft/RaftProtoCodec.cpp \
+        src/Raft/RaftServiceImpl.cpp \
+        src/Raft/RaftPeerClients.cpp
 SERVER_OBJ = $(patsubst src/%.cpp,build/%.o,$(SERVER_SRC))
 SERVER_BIN = build/stoneleaf-server
 
@@ -132,9 +161,12 @@ benchmark-run: $(BENCHMARK_BIN)
 	./$(BENCHMARK_BIN)
 
 $(SERVER_BIN): CXXFLAGS += -pthread
-$(SERVER_BIN): $(SERVER_OBJ) $(LIB)
+# The Raft RPC sources live here rather than in $(LIB) on purpose: putting them
+# in the library would force protobuf and gRPC onto every test binary that links
+# it. The server is the only thing that needs them.
+$(SERVER_BIN): $(SERVER_OBJ) $(PROTO_OBJ) $(LIB)
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) $(GRPC_LDLIBS)
 
 build/%.o: src/%.cpp
 	mkdir -p $(dir $@)
@@ -164,6 +196,42 @@ build/benchmarks/lib/%.o: src/%.cpp
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -O3 -DNDEBUG -pthread -c $< -o $@
 
+$(GEN_DIR)/raft.pb.cc $(GEN_DIR)/raft.grpc.pb.cc: $(PROTO_DIR)/raft.proto
+	@mkdir -p $(GEN_DIR)
+	@command -v $(PROTOC) >/dev/null 2>&1 || { \
+	  echo "ERROR: protoc not found (looked for '$(PROTOC)')."; \
+	  echo "  Install the protobuf compiler and gRPC plugin:"; \
+	  echo "    macOS:  brew install protobuf grpc pkg-config"; \
+	  echo "    Debian: apt-get install -y protobuf-compiler protobuf-compiler-grpc \\"; \
+	  echo "                               libprotobuf-dev libgrpc++-dev pkg-config"; \
+	  echo "  Or override: make PROTOC=/path/to/protoc GRPC_CPP_PLUGIN=/path/to/grpc_cpp_plugin"; \
+	  exit 1; }
+	@command -v $(GRPC_CPP_PLUGIN) >/dev/null 2>&1 || { \
+	  echo "ERROR: grpc_cpp_plugin not found (looked for '$(GRPC_CPP_PLUGIN)')."; \
+	  echo "  It ships separately from protoc: 'brew install grpc' or"; \
+	  echo "  'apt-get install protobuf-compiler-grpc'."; \
+	  exit 1; }
+	$(PROTOC) -I $(PROTO_DIR) --cpp_out=$(GEN_DIR) --grpc_out=$(GEN_DIR) \
+	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
+
+# protoc writes the headers next to the sources. An empty recipe states that
+# without giving make a reason to run protoc a second time.
+$(GEN_DIR)/raft.pb.h $(GEN_DIR)/raft.grpc.pb.h: $(GEN_DIR)/raft.pb.cc ;
+
+# Anything including a generated header has to wait for protoc. Without this,
+# a fresh clone - or any build after make clean, which deletes build/gen -
+# compiles the codec before the header exists.
+build/Raft/RaftProtoCodec.o: $(GEN_DIR)/raft.pb.h
+build/Raft/RaftServiceImpl.o: $(GEN_DIR)/raft.grpc.pb.h
+build/Raft/RaftPeerClients.o: $(GEN_DIR)/raft.grpc.pb.h
+build/server/server.o: $(GEN_DIR)/raft.grpc.pb.h
+build/tests/unit/RaftProtoCodec_test.o: $(GEN_DIR)/raft.pb.h
+build/tests/integration/RaftService_test.o: $(GEN_DIR)/raft.grpc.pb.h
+build/tests/integration/RaftTransport_test.o: $(GEN_DIR)/raft.grpc.pb.h
+
+$(GEN_DIR)/%.o: $(GEN_DIR)/%.cc
+	$(CXX) --std=c++23 -w $(GRPC_CXXFLAGS) -I$(GEN_DIR) -c $< -o $@
+
 $(BENCHMARK_LIB): $(BENCHMARK_LIB_OBJ)
 	mkdir -p $(dir $@)
 	$(AR) $(ARFLAGS) $@ $^
@@ -180,6 +248,29 @@ build/tests/integration/RecoveryWatermark_test: CXXFLAGS += -pthread
 build/tests/integration/RecoveryWatermark_test: LDLIBS += -pthread
 build/tests/integration/RaftApplier_test: CXXFLAGS += -pthread
 build/tests/integration/RaftApplier_test: LDLIBS += -pthread
+# Needs the generated message code and protobuf, like CommandServer_test
+# needs CommandServer.o. Not in $(LIB) yet: nothing in the library uses the
+# codec until the RPC layer lands.
+build/tests/unit/RaftProtoCodec_test: build/tests/unit/RaftProtoCodec_test.o build/Raft/RaftProtoCodec.o $(GEN_DIR)/raft.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS)
+
+# The RaftService::Service base class lives in raft.grpc.pb.o, the messages in
+# raft.pb.o, and the handlers convert through the codec. Explicit rather than
+# left to the pattern rule above, which links only $(LIB) - and, as with the
+# codec, none of this is in $(LIB) until the server actually starts a gRPC
+# server. -pthread because RaftState's mutex and condition variables are live.
+build/tests/integration/RaftService_test: CXXFLAGS += -pthread
+build/tests/integration/RaftService_test: build/tests/integration/RaftService_test.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
+
+# Stands up real gRPC servers, so it needs the peer clients too.
+build/tests/integration/RaftTransport_test: CXXFLAGS += -pthread
+build/tests/integration/RaftTransport_test: build/tests/integration/RaftTransport_test.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
+
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
 build/tests/unit/BTreeOperation_test: CXXFLAGS += -pthread

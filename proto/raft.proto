@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package stoneleaf.raft;
+
+// Value names are scoped to the PACKAGE, not the enum, so they are prefixed:
+// unprefixed DELETE collides with a <winnt.h> macro, and UNSPECIFIED would
+// collide with the next enum added to stoneleaf.raft.
+enum MutationType {
+    MUTATION_UNSPECIFIED = 0;
+    MUTATION_PUT = 1;
+    MUTATION_DELETE = 2;
+}
+
+message ProtoKey {
+    uint32 type = 1;
+    bytes data = 2;
+}
+
+message ProtoValue {
+    uint32 type = 1;
+    bytes data = 2;
+}
+
+message Mutation {
+    MutationType type = 1;
+    ProtoKey key = 2;
+    ProtoValue value = 3; // absent for Delete
+}
+
+message RaftEntry {
+    uint64 term = 1;
+    uint64 idx = 2;
+    repeated Mutation operations = 3;
+}
+
+message AppendEntriesRequest {
+    uint64 term = 1;
+    string leader = 2; // host:port string
+    uint64 prev_log_idx = 3;
+    uint64 prev_log_term = 4;
+    repeated RaftEntry entries = 5;
+    uint64 leader_commit_idx = 6;
+}
+
+
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+}
+
+message RequestVoteRequest {
+    uint64 term = 1;
+    string candidate = 2; // host:port string
+    uint64 last_log_idx = 3;
+    uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+service RaftService {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+}
