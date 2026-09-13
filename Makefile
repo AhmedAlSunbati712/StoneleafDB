@@ -181,6 +181,16 @@ $(GEN_DIR)/raft.pb.cc $(GEN_DIR)/raft.grpc.pb.cc: $(PROTO_DIR)/raft.proto
 	$(PROTOC) -I $(PROTO_DIR) --cpp_out=$(GEN_DIR) --grpc_out=$(GEN_DIR) \
 	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
 
+# protoc writes the headers next to the sources. An empty recipe states that
+# without giving make a reason to run protoc a second time.
+$(GEN_DIR)/raft.pb.h $(GEN_DIR)/raft.grpc.pb.h: $(GEN_DIR)/raft.pb.cc ;
+
+# Anything including a generated header has to wait for protoc. Without this,
+# a fresh clone - or any build after make clean, which deletes build/gen -
+# compiles the codec before the header exists.
+build/Raft/RaftProtoCodec.o: $(GEN_DIR)/raft.pb.h
+build/tests/unit/RaftProtoCodec_test.o: $(GEN_DIR)/raft.pb.h
+
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.cc
 	$(CXX) --std=c++23 -w $(GRPC_CXXFLAGS) -I$(GEN_DIR) -c $< -o $@
 
