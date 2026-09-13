@@ -1,5 +1,15 @@
+PROTO_DIR = proto
+GEN_DIR = build/gen
+
+PROTOC = /opt/homebrew/bin/protoc
+GRPC_CPP_PLUGIN = /opt/homebrew/bin/grpc_cpp_plugin
+PKG_CONFIG      = /opt/homebrew/bin/pkg-config
+
+GRPC_CXXFLAGS := $(shell $(PKG_CONFIG) --cflags grpc++ protobuf)
+GRPC_LDLIBS   := $(shell $(PKG_CONFIG) --libs   grpc++ protobuf)
+
 CXX = g++
-CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
+CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -I build/gen $(GRPC_CXXFLAGS) -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lgtest -lgtest_main
 AR = ar
@@ -95,6 +105,8 @@ OBJ = \
 	build/DBHeaderCodec.o \
 	build/V2PageCodec.o
 
+PROTO_OBJ = $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o
+
 UNIT_TEST_SRC := $(wildcard tests/unit/*.cpp)
 UNIT_TEST_OBJ := $(patsubst tests/unit/%.cpp,build/tests/unit/%.o,$(UNIT_TEST_SRC))
 UNIT_TEST_BIN := $(patsubst tests/unit/%.cpp,build/tests/unit/%,$(UNIT_TEST_SRC))
@@ -164,6 +176,14 @@ build/benchmarks/lib/%.o: src/%.cpp
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -O3 -DNDEBUG -pthread -c $< -o $@
 
+$(GEN_DIR)/raft.pb.cc $(GEN_DIR)/raft.grpc.pb.cc: $(PROTO_DIR)/raft.proto
+	@mkdir -p $(GEN_DIR)
+	$(PROTOC) -I $(PROTO_DIR) --cpp_out=$(GEN_DIR) --grpc_out=$(GEN_DIR) \
+	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
+
+$(GEN_DIR)/%.o: $(GEN_DIR)/%.cc
+	$(CXX) --std=c++23 -w $(GRPC_CXXFLAGS) -I$(GEN_DIR) -c $< -o $@
+
 $(BENCHMARK_LIB): $(BENCHMARK_LIB_OBJ)
 	mkdir -p $(dir $@)
 	$(AR) $(ARFLAGS) $@ $^
@@ -180,6 +200,13 @@ build/tests/integration/RecoveryWatermark_test: CXXFLAGS += -pthread
 build/tests/integration/RecoveryWatermark_test: LDLIBS += -pthread
 build/tests/integration/RaftApplier_test: CXXFLAGS += -pthread
 build/tests/integration/RaftApplier_test: LDLIBS += -pthread
+# Needs the generated message code and protobuf, like CommandServer_test
+# needs CommandServer.o. Not in $(LIB) yet: nothing in the library uses the
+# codec until the RPC layer lands.
+build/tests/unit/RaftProtoCodec_test: build/tests/unit/RaftProtoCodec_test.o build/Raft/RaftProtoCodec.o $(GEN_DIR)/raft.pb.o $(LIB)
+	mkdir -p $(dir $@)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS)
+
 build/tests/unit/KeyLockManager_test: CXXFLAGS += -pthread
 build/tests/unit/KeyLockManager_test: LDLIBS += -pthread
 build/tests/unit/BTreeOperation_test: CXXFLAGS += -pthread
