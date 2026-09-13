@@ -223,8 +223,19 @@ struct MutationOp {
 //
 // nullopt is a tombstone (this transaction deleted the key), which is a
 // different state from the key simply being absent from the map.
+// Key deliberately has no comparison operators - the engine compares keys
+// through KeyCodec::compare - so the map needs an explicit comparator. Giving
+// Key a defaulted operator<=> instead would order by (type, size, data), which
+// is NOT the order the storage engine uses; two disagreeing key orderings in one
+// codebase is the kind of defect that surfaces much later as a corrupt index.
+struct KeyOrder {
+    bool operator()(const Key& lhs, const Key& rhs) const {
+        return KeyCodec::compare(lhs, rhs) < 0;
+    }
+};
+
 struct TransactionWriteBuffer {
-    std::map<Key, std::optional<Value>> writes;
+    std::map<Key, std::optional<Value>, KeyOrder> writes;
 
     // Collapses repeated writes to the same key into last-write-wins, so
     // put(k,1); put(k,2) produces a single MutationOp.
@@ -610,6 +621,15 @@ advance_commit_index():
             notify the apply loop
             break
 ```
+
+**`advance_commit_index()` has two callers, not one.** Every replication thread calls it after a peer accepts entries — and the **proposing session** calls it too, once its own copy reaches disk. The second is not an optimization. A single-node cluster has no replication threads at all, so without that caller nothing would ever commit; and even in a larger cluster the leader's own `fsync` completing is frequently what forms the majority, since the leader counts toward its own quorum.
+
+That is also why it lives in its own translation unit rather than inside the replicator: the replicator's implementation includes the generated gRPC headers, and defining this beside it would drag protobuf and gRPC into the core library and therefore into every binary that links it. Keeping it proto-free is what lets the session path call it.
+
+**The leader counts itself only once `durable_index() >= N`.** Rather than calling `sync_through()` here — which would hold `state_mutex` across an `fsync` — the propose path syncs after appending with the lock released, and this test simply observes the result. Same guarantee, no I/O under the state lock.
+
+**`send_next` starts optimistic, so catching up a lagging follower costs round trips.** `become_leader()` sets `send_next[i] = last_index + 1` for every peer. If a follower's log is shorter, the first `AppendEntries` carries no entries at all, fails the consistency check, and backs `send_next` off by one — so convergence takes one round trip per missing entry. This is the O(entries) behaviour the paper's conflicting-term hint replaces with O(terms). It self-corrects promptly because the replication thread waits for the heartbeat only while `send_next > last_index`; while backing off it retries immediately.
+
 ### Messages
 ```c++
 struct AppendEntriesRequest {
