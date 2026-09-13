@@ -1,12 +1,26 @@
 PROTO_DIR = proto
 GEN_DIR = build/gen
 
-PROTOC = /opt/homebrew/bin/protoc
-GRPC_CPP_PLUGIN = /opt/homebrew/bin/grpc_cpp_plugin
-PKG_CONFIG      = /opt/homebrew/bin/pkg-config
+PKG_CONFIG ?= pkg-config
 
 GRPC_CXXFLAGS := $(shell $(PKG_CONFIG) --cflags grpc++ protobuf)
 GRPC_LDLIBS   := $(shell $(PKG_CONFIG) --libs   grpc++ protobuf)
+
+# protoc has to match the protobuf headers we compile against: generated code
+# carries a version assertion, so a 3.x protoc against a 36.x runtime does not
+# merely warn, it fails to compile. That rules out taking whatever protoc comes
+# first on PATH - on a dev box with conda or a vendored toolchain installed, that
+# is routinely a different major version from the one pkg-config reports.
+#
+# So resolve each tool from the prefix of the library it must agree with, and
+# fall back to PATH only when that prefix has no binary (which is how a
+# distro-packaged layout with a separate -compiler package behaves). Both stay
+# overridable from the command line or the environment.
+PROTOBUF_PREFIX := $(shell $(PKG_CONFIG) --variable=prefix protobuf 2>/dev/null)
+GRPC_PREFIX     := $(shell $(PKG_CONFIG) --variable=prefix grpc++ 2>/dev/null)
+
+PROTOC ?= $(firstword $(wildcard $(PROTOBUF_PREFIX)/bin/protoc) protoc)
+GRPC_CPP_PLUGIN ?= $(firstword $(wildcard $(GRPC_PREFIX)/bin/grpc_cpp_plugin) grpc_cpp_plugin)
 
 CXX = g++
 CXXFLAGS = -Wall --std=c++23 -Iinclude -Iinclude/disk -Iinclude/encoding -Iinclude/containers -Iinclude/client -I build/gen $(GRPC_CXXFLAGS) -Iinclude/LockManager -Iinclude/TransactionManager -I/opt/homebrew/include -Iinclude/API
@@ -184,6 +198,19 @@ build/benchmarks/lib/%.o: src/%.cpp
 
 $(GEN_DIR)/raft.pb.cc $(GEN_DIR)/raft.grpc.pb.cc: $(PROTO_DIR)/raft.proto
 	@mkdir -p $(GEN_DIR)
+	@command -v $(PROTOC) >/dev/null 2>&1 || { \
+	  echo "ERROR: protoc not found (looked for '$(PROTOC)')."; \
+	  echo "  Install the protobuf compiler and gRPC plugin:"; \
+	  echo "    macOS:  brew install protobuf grpc pkg-config"; \
+	  echo "    Debian: apt-get install -y protobuf-compiler protobuf-compiler-grpc \\"; \
+	  echo "                               libprotobuf-dev libgrpc++-dev pkg-config"; \
+	  echo "  Or override: make PROTOC=/path/to/protoc GRPC_CPP_PLUGIN=/path/to/grpc_cpp_plugin"; \
+	  exit 1; }
+	@command -v $(GRPC_CPP_PLUGIN) >/dev/null 2>&1 || { \
+	  echo "ERROR: grpc_cpp_plugin not found (looked for '$(GRPC_CPP_PLUGIN)')."; \
+	  echo "  It ships separately from protoc: 'brew install grpc' or"; \
+	  echo "  'apt-get install protobuf-compiler-grpc'."; \
+	  exit 1; }
 	$(PROTOC) -I $(PROTO_DIR) --cpp_out=$(GEN_DIR) --grpc_out=$(GEN_DIR) \
 	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
 
