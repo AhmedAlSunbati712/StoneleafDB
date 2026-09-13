@@ -1205,7 +1205,9 @@ Every thread in the server, what it waits on, and when it exists.
 | RPC handlers | gRPC's pool | whole process | gRPC | inbound `AppendEntries` / `RequestVote` |
 
 ### Replication threads are parked, not spawned and joined
-They are created once at startup — one per peer, on every server — and park on `replication_cv` whenever `state != Leader`. `become_leader()` notifies them; `become_follower()` does nothing, because each thread re-checks its own predicate on the next wake and parks itself.
+They are created once at startup — one per peer, on every server — and park on `replication_cv` whenever `state != Leader`. `become_follower()` does nothing, because each thread re-checks its own predicate on the next wake and parks itself.
+
+**The notification comes from the winner of the election, not from `become_leader()`.** `become_leader()` only rebuilds `send_next` and `replicated_index` and sets the state; it touches no condition variable, and it cannot sensibly do so, since it is called with `state_mutex` held by a caller that may still have work to do before the replication threads should run. The election thread therefore calls `replication_cv.notify_all()` immediately after `become_leader()` returns. Any future path that promotes a node to leader owes the same notification — without it the replication threads stay parked and a freshly elected leader silently never replicates, which presents as a cluster that elects a leader and then makes no progress.
 
 The alternative, spawning them in `become_leader()` and joining them in `become_follower()`, is worse on every axis that matters here. Joining means blocking a state transition until each thread returns from whatever it is doing, and what it is doing is frequently an in-flight RPC to an unreachable peer — so the step-down stalls for the RPC timeout, on the path that most needs to be fast. Election churn is exactly the situation where leadership flips repeatedly, and layering thread churn on top of it multiplies the failure modes. A thread blocked on a condition variable costs a stack and no CPU.
 
