@@ -1,5 +1,6 @@
 #include <Raft/RaftElection.h>
 
+#include <Raft/RaftCommitIndex.h>
 #include <Raft/RaftPeerClients.h>
 
 #include <grpcpp/client_context.h>
@@ -167,10 +168,19 @@ void RaftElection::append_leader_noop() {
         }
 
         index = raft_log_.append(term, {});
+    }
 
+    // Durable before it can count toward a majority, exactly as the propose
+    // path does, and with the lock released: this is an fsync.
+    raft_log_.sync_through(index);
+
+    {
         std::lock_guard lock(state_.state_mutex);
         if (state_.state() == State::Leader && state_.current_term() == term) {
             state_.set_leader_term_first_index(index);
+            // In a single-node cluster nothing else would ever count it, so
+            // reads would wait for a write to happen first.
+            advance_commit_index(state_, raft_log_);
         }
     }
 
