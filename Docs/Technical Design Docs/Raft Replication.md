@@ -395,7 +395,7 @@ The commit record is the right home for it rather than the record header: it is 
 
 One thing to verify when implementing: `TransactionManager::commit` calls `release_locks`, which for an apply transaction runs against an empty lock set. That should be a no-op, but confirm it does not assert.
 
-**`last_applied` advances only after the WAL is synced.** Sessions wake on `last_applied >= idx` and immediately reply success to the client, so advancing it before `flush wal log` would report a commit that is not yet durable. The batch is applied, then flushed, then the watermark moves.
+**`last_applied` advances without a WAL sync.** Sessions wake on `last_applied >= idx` and immediately reply success, and that is safe with the WAL tail unsynced because the WAL is not what makes the write durable: a committed entry is already in the Raft log of a majority. The WAL tail only records *having applied* it. If a crash loses that tail, WAL-before-data guarantees no page from it reached the database file, so the node comes back in exactly the state of some Raft log prefix; recovery reports that prefix as `last_applied` (*Seeding `commit_index` and `last_applied` on startup*), and the remaining committed entries are applied again. An earlier design synced here, which cost a full sync per batch on the leader's commit path for no durability it did not already have.
 
 ```
 apply loop:
@@ -409,11 +409,11 @@ apply loop:
             switch operation.type:
                 case Put:    KeyStore.put(txn, operation.key, operation.value, Locking::Skip)
                 case Delete: KeyStore.remove(txn, operation.key, Locking::Skip)
-        TxnMgr.commit(txn, Durability::Defer)   // no fsync yet; the batch syncs once below
+        TxnMgr.commit(txn, Durability::Defer)   // never synced here; see above
         batch_end++
         num_applied++
-    flush wal log
-    // Durable only now, so only now may a waiting session reply success.
+    // The entries are durable in the Raft log already; a lost WAL tail is
+    // re-applied after recovery.
     last_applied <- batch_end
     notify waiting sessions
 ```
