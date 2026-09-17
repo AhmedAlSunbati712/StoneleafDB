@@ -4,6 +4,7 @@
 #include <Raft/RaftEntry.h>
 #include <Raft/RaftSegment.h>
 
+#include <condition_variable>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -49,5 +50,13 @@ private:
     bool directory_dirty_ = false;
     mutable std::shared_mutex mutex_;
 
+    // Group commit, as in Log: one thread fsyncs at a time with mutex_
+    // released; truncate_suffix(), close() and the destructor wait for it,
+    // since it holds raw segment pointers and its result must not be applied
+    // over a truncation.
+    bool sync_in_progress_ = false;
+    std::condition_variable_any sync_done_;
+
     void create_segment(std::uint64_t base_index);
+    void wait_for_sync_to_finish(std::unique_lock<std::shared_mutex>& lock);
 };
