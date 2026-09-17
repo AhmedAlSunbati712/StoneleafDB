@@ -3,11 +3,13 @@
 #include <Raft/NodeAddress.h>
 #include <Raft/RaftHardStateStore.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -138,6 +140,59 @@ class RaftState {
         std::uint64_t send_next(const NodeAddress& peer) const { return send_next_.at(peer); }
         std::uint64_t replicated_index(const NodeAddress& peer) const { return replicated_index_.at(peer); }
 
+        // --- Read-index confirmation ----------------------------------------
+        // A consistent read may not be answered from local state until a
+        // majority has confirmed, since the read arrived, that this node is
+        // still leader: an isolated leader is never told it was deposed, so
+        // its own state proves nothing. Confirmation is a round of ordinary
+        // heartbeats, identified by a counter so that a reply to a round that
+        // started BEFORE the read cannot be mistaken for proof.
+        //
+        // Rounds and acknowledgements are per leadership and never persisted.
+        std::uint64_t read_round() const noexcept { return read_round_; }
+        std::uint64_t confirmed_read_round() const noexcept { return confirmed_read_round_; }
+        std::uint64_t acked_read_round(const NodeAddress& peer) const { return acked_read_round_.at(peer); }
+
+        // Opens the next round and returns its number. The caller notifies
+        // replication_cv so the replication threads heartbeat immediately
+        // rather than at the next HEARTBEAT_INTERVAL.
+        std::uint64_t start_read_round() noexcept { return ++read_round_; }
+
+        // One peer's reply to round `round`. A reply proves that peer still
+        // recognized this term, which is what leadership confirmation needs -
+        // whether or not the AppendEntries itself succeeded. Advances
+        // confirmed_read_round_ once this node plus the acking peers form a
+        // majority, and notifies the readers waiting on it.
+        void record_read_ack(const NodeAddress& peer, std::uint64_t round) {
+            std::uint64_t& acked = acked_read_round_.at(peer);
+            if (round <= acked) return;
+            acked = round;
+
+            // The highest round a majority holds: with the leader counted, that
+            // is the (majority - 1)-th largest peer acknowledgement.
+            std::vector<std::uint64_t> rounds;
+            rounds.reserve(acked_read_round_.size());
+            for (const auto& [address, value] : acked_read_round_) rounds.push_back(value);
+            std::sort(rounds.begin(), rounds.end(), std::greater<>());
+            const std::size_t peers_needed = cluster_size_ / 2 + 1 - 1;
+            if (peers_needed == 0 || peers_needed > rounds.size()) return;
+            const std::uint64_t confirmed = rounds[peers_needed - 1];
+            if (confirmed > confirmed_read_round_) {
+                confirmed_read_round_ = confirmed;
+                read_cv.notify_all();
+            }
+        }
+
+        // The index of the no-op this leadership appended on winning. Until it
+        // commits, commit_index_ can lag the true committed prefix (only an
+        // entry from the leader's own term commits by replica count, Figure 8),
+        // so a read taken before then could miss a committed write. 0 means
+        // the leader has not appended it yet.
+        std::uint64_t leader_term_first_index() const noexcept { return leader_term_first_index_; }
+        void set_leader_term_first_index(std::uint64_t index) noexcept {
+            leader_term_first_index_ = index;
+        }
+
         // Every peer's replicated index, for advance_commit_index()'s majority count.
         const std::unordered_map<NodeAddress, std::uint64_t>& replicated_indexes() const noexcept {
             return replicated_index_;
@@ -207,6 +262,7 @@ class RaftState {
         std::condition_variable apply_cv;       // apply loop: commit_index > last_applied (notify_one, single waiter)
         std::condition_variable applied_cv;     // sessions: last_applied >= their own idx (notify_all, many waiters)
         std::condition_variable replication_cv; // replication threads: entries appended, or we became leader (notify_all)
+        std::condition_variable read_cv;        // readers: a read round was confirmed, or commit_index moved (notify_all)
 
         // Set under state_mutex at shutdown, then every condition variable is
         // notified. Tested by EVERY wait predicate in the server: a thread
@@ -247,6 +303,12 @@ class RaftState {
         // gRPC address -> database server address, for every node including
         // ourselves. Built once from the cluster config; never modified.
         std::unordered_map<NodeAddress, NodeAddress> cluster_nodes_;
+        // Leader-only, per leadership: read-index confirmation rounds.
+        std::unordered_map<NodeAddress, std::uint64_t> acked_read_round_;
+        std::uint64_t read_round_ = 0;
+        std::uint64_t confirmed_read_round_ = 0;
+        std::uint64_t leader_term_first_index_ = 0;
+
         std::size_t cluster_size_ = 0; // cluster_nodes_.size(): peers + ourselves. Used for majority
 
         // Leader-only. Cleared and fully repopulated by become_leader() on

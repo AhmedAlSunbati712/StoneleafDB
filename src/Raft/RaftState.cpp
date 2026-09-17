@@ -97,9 +97,16 @@ void RaftState::become_candidate() {
 void RaftState::become_leader(std::uint64_t last_log_index) {
     send_next_.clear();
     replicated_index_.clear();
+    // Read confirmation is per leadership for the same reason progress is: an
+    // acknowledgement from an earlier term proves nothing about this one, and
+    // the no-op index belongs to the leadership that appended it.
+    acked_read_round_.clear();
+    confirmed_read_round_ = 0;
+    leader_term_first_index_ = 0;
     for (const NodeAddress& peer : peers_) {
         send_next_.emplace(peer, last_log_index + 1);
         replicated_index_.emplace(peer, 0);
+        acked_read_round_.emplace(peer, 0);
     }
     leader_raft_address_ = self_raft_address_;
     state_ = State::Leader;
