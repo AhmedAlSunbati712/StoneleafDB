@@ -1086,6 +1086,8 @@ It is *only* a lower bound. Entries above it may or may not be committed, and **
 
 This requires the `raft_index` field on `CommitPayload` described under *Applying a committed Raft entry*.
 
+**The watermark must outlive WAL cleanup.** Recovery ends by deleting every segment except the active one, and nothing guarantees the active segment holds an applied entry's commit record — client transactions alone can fill segments. Without care, the next restart reads a watermark of 0 and re-applies the Raft log from index 1 on top of a tree that already holds it; the apply loop fails and the node aborts on every start. So before cleanup, `finish_recovery()` re-records `last_applied` in the active segment as a synced commit of an empty transaction whose `raft_index` is the recovered watermark. Step 2 then finds it on the next start however much was deleted.
+
 ## Leader Election
 Servers start as followers. A follower that reaches its election deadline without hearing from a leader becomes a candidate and starts an election. The timer itself — what resets it, and why it is a deadline rather than a cancellable timer — is described under *Locking discipline*; this section covers what happens once it fires.
 

@@ -42,7 +42,7 @@ Once every loser is fully resolved, call `sync_through` on the highest LSN appen
 
 ## 4. Cleanup
 
-Delete every segment that is not the currently-active one. This is safe here specifically because step 2 walked the *entire* retained log and step 3 fully resolved every transaction found unresolved in it — by this point every record in every non-active segment has had its effects applied to the database file, and every transaction referenced anywhere in the retained log has a durable `TxnCommit` or `TxnEnd`. Nothing later can need to re-read a deleted segment.
+First re-record the Raft applied watermark in the active segment (a synced empty commit carrying `raft_index`), because the commit records that carried it may all live in segments about to be deleted — see *Seeding `commit_index` and `last_applied` on startup* in `Raft Replication.md`. Then delete every segment that is not the currently-active one. This is safe here specifically because step 2 walked the *entire* retained log and step 3 fully resolved every transaction found unresolved in it — by this point every record in every non-active segment has had its effects applied to the database file, and every transaction referenced anywhere in the retained log has a durable `TxnCommit` or `TxnEnd`. Nothing later can need to re-read a deleted segment.
 
 ## 5. Start serving
 
