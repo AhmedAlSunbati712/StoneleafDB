@@ -224,4 +224,36 @@ TEST_F(RecoveryWatermarkTest, SurvivesCleanupOfEverySegmentThatCarriedIt) {
     EXPECT_EQ(recovered_watermark(), 3u);
 }
 
+TEST_F(RecoveryWatermarkTest, PagesRestoredOnlyByRedoAreReadable) {
+    // The node goes down with an open transaction, so no page was flushed at
+    // close: every tree page on disk after recovery was written by redo.
+    constexpr std::uint64_t entry_count = 300;
+    std::vector<std::vector<MutationOp>> entries;
+    for (std::uint64_t id = 0; id < entry_count; ++id) {
+        entries.push_back({put_op(id, "a")});
+    }
+    apply_entries(entries, /*leave_one_uncommitted=*/true);
+
+    KeyStore store;
+    LockManager lock_manager;
+    Log wal(reopened_wal_config(db_file));
+    TransactionManager transaction_manager(wal, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    wal.open(db_file + ".wal");
+    std::unordered_map<TransactionId, Lsn> unresolved;
+    std::uint64_t last_applied = 0;
+    aries_recovery_redo(wal, db_file, unresolved, last_applied);
+    ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+    aries_recovery_undo(wal, store, unresolved);
+
+    for (std::uint64_t id = 0; id < entry_count; ++id) {
+        TransactionHandle reader = transaction_manager.begin();
+        const KeyStoreGetResult result =
+            store.get(reader, KeyCodec::encode(KeyInput{id}).value());
+        ASSERT_EQ(result.status, KeyStoreStatus::Success) << "key " << id;
+        ASSERT_EQ(transaction_manager.commit(reader), CommitStatus::Success);
+    }
+    ASSERT_EQ(store.close(), KeyStoreStatus::Success);
+}
+
 } // namespace
