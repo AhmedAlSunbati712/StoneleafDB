@@ -11,6 +11,7 @@
 #include <Raft/RaftLog.h>
 #include <Raft/RaftPeerClients.h>
 #include <Raft/RaftProposer.h>
+#include <Raft/RaftReadIndex.h>
 #include <Raft/RaftReplicator.h>
 #include <Raft/RaftServiceImpl.h>
 #include <Raft/RaftState.h>
@@ -344,6 +345,11 @@ int main(int argc, char *argv[]) {
     // writes into a Raft entry and waits for it to apply.
     RaftProposer proposer(*raft_state, raft_log);
 
+    // Consistent reads: confirm leadership with a heartbeat round before
+    // answering from local state. A follower's reads are refused with
+    // NotLeader rather than served stale.
+    RaftReadIndex read_index(*raft_state);
+
     // 7. The election timer. LAST of the Raft threads on purpose: this is the
     //    first moment the node can campaign, so nothing a campaign depends on -
     //    the RPC server, the peer stubs - may start after it.
@@ -453,8 +459,8 @@ int main(int argc, char *argv[]) {
         try {
             std::lock_guard lock(sessions.mutex);
             sessions.open_sockets.insert(socket_fd);
-            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager, &proposer] {
-                CommandServer::serve_connection(socket_fd, key_store, transaction_manager, &proposer);
+            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager, &proposer, &read_index] {
+                CommandServer::serve_connection(socket_fd, key_store, transaction_manager, &proposer, &read_index);
                 std::lock_guard lock(sessions.mutex);
                 sessions.open_sockets.erase(socket_fd);
             });
@@ -481,6 +487,7 @@ int main(int argc, char *argv[]) {
     raft_state->replication_cv.notify_all();
     raft_state->apply_cv.notify_all();
     raft_state->applied_cv.notify_all();
+    raft_state->read_cv.notify_all();
 
     // 3. Sessions: wake any thread blocked reading its socket, then join. The
     //    acceptor has stopped, so no descriptor is being handed out any more.

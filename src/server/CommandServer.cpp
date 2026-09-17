@@ -1,5 +1,7 @@
 #include <server/CommandServer.h>
 
+#include <Raft/RaftReadIndex.h>
+
 #include <Command.h>
 #include <LockManager/LockManager.h>
 #include <NetCodec.h>
@@ -201,12 +203,23 @@ KeyStoreStatus propose_and_settle(
     return to_status(status);
 }
 
+// Maps the read-index gate onto the statuses the wire protocol already carries.
+KeyStoreStatus to_status(ReadIndexStatus status) {
+    switch (status) {
+        case ReadIndexStatus::Ready:     return KeyStoreStatus::Success;
+        case ReadIndexStatus::NotLeader: return KeyStoreStatus::NotLeader;
+        case ReadIndexStatus::Timeout:   break;
+    }
+    return KeyStoreStatus::ReadFailed;
+}
+
 void execute_replicated_command(
     int socket_fd,
     KeyStore &key_store,
     TransactionManager &transaction_manager,
     SessionContext &context,
     RaftProposer &proposer,
+    RaftReadIndex *read_index,
     const Command &command
 ) {
     if (command.op == Operator::BEGIN_TXN) {
@@ -283,7 +296,16 @@ void execute_replicated_command(
         } else if (found == TransactionWriteBuffer::Lookup::Deleted) {
             result.status = KeyStoreStatus::KeyNotFound;
         } else {
-            result = key_store.get(transaction, *command.key);
+            // Anything not answered from this session's own buffer comes from
+            // replicated state, so leadership is confirmed first: a deposed
+            // leader would otherwise serve a value a newer leader has moved
+            // past. The buffer cases above are this session's own writes.
+            const KeyStoreStatus gate = read_index
+                ? to_status(read_index->wait_until_readable())
+                : KeyStoreStatus::Success;
+            result = gate == KeyStoreStatus::Success
+                ? key_store.get(transaction, *command.key)
+                : KeyStoreGetResult{.status = gate};
         }
 
         if (implicit) {
@@ -463,7 +485,8 @@ void serve_connection(
     int socket_fd,
     KeyStore &key_store,
     TransactionManager &transaction_manager,
-    RaftProposer *proposer
+    RaftProposer *proposer,
+    RaftReadIndex *read_index
 ) noexcept {
     SessionContext context{};
 
@@ -477,6 +500,7 @@ void serve_connection(
                     transaction_manager,
                     context,
                     *proposer,
+                    read_index,
                     command);
             } else {
                 execute_transactional_command(

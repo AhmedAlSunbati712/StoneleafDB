@@ -5,6 +5,7 @@
 #include <TransactionManager/TransactionManager.h>
 
 class RaftProposer;
+class RaftReadIndex;
 
 struct SessionContext {
     TransactionHandle active_transaction;
@@ -34,6 +35,10 @@ void serve_connection(
     int socket_fd,
     KeyStore &key_store,
     TransactionManager &transaction_manager,
-    RaftProposer *proposer) noexcept;
+    RaftProposer *proposer,
+    // Gate for consistent reads on a replicated node. nullptr serves reads
+    // from local state without confirming leadership, which is what a
+    // standalone node does and all a follower can offer.
+    RaftReadIndex *read_index) noexcept;
 
 } // namespace CommandServer

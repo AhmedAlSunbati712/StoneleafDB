@@ -5,6 +5,8 @@
 #include <LockManager/LockManager.h>
 #include <Log/Log.h>
 #include <Raft/RaftApplier.h>
+#include <Raft/RaftCommitIndex.h>
+#include <Raft/RaftReadIndex.h>
 #include <Raft/RaftHardStateStore.h>
 #include <Raft/RaftLog.h>
 #include <Raft/RaftPeerClients.h>
@@ -474,6 +476,17 @@ protected:
             state->advance_term(1, self_raft);
             state->become_leader(raft_log->last_index());
         }
+
+        // As RaftElection does on winning: the leadership's no-op, made
+        // durable and counted, which is what read-index confirmation waits
+        // for. Without it a consistent read has no accurate commit_index.
+        const std::uint64_t noop = raft_log->append(1, {});
+        raft_log->sync_through(noop);
+        {
+            std::lock_guard lock(state->state_mutex);
+            state->set_leader_term_first_index(noop);
+            advance_commit_index(*state, *raft_log);
+        }
     }
 
     void TearDown() override {
@@ -550,10 +563,12 @@ TEST_F(SingleNodeReplicationTest, TheWriteBufferCollapsesRepeatedWritesToOneKey)
 
 TEST_F(SingleNodeReplicationTest, AReadOnlyTransactionCommitsWithoutProposing) {
     RaftProposer proposer(*state, *raft_log);
+    RaftReadIndex read_index(*state);
     int sockets[2] = {-1, -1};
     ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
     std::thread dispatcher(CommandServer::serve_connection, sockets[1],
-                           std::ref(store), std::ref(*transaction_manager), &proposer);
+                           std::ref(store), std::ref(*transaction_manager), &proposer,
+                           &read_index);
     {
         Session session(sockets[0], 0);
         session.begin_transaction();

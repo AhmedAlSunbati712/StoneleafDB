@@ -43,8 +43,10 @@ class Connection {
                 sockets[1],
                 std::ref(key_store),
                 std::ref(transaction_manager),
-                // No proposer: this fixture has no cluster, so writes go
-                // straight through KeyStore exactly as they always have.
+                // No proposer and no read index: this fixture has no cluster,
+                // so writes go straight through KeyStore and reads are served
+                // from local state, exactly as they always have.
+                nullptr,
                 nullptr);
         }
 
@@ -87,8 +89,10 @@ class RawConnection {
                 sockets[1],
                 std::ref(key_store),
                 std::ref(transaction_manager),
-                // No proposer: this fixture has no cluster, so writes go
-                // straight through KeyStore exactly as they always have.
+                // No proposer and no read index: this fixture has no cluster,
+                // so writes go straight through KeyStore and reads are served
+                // from local state, exactly as they always have.
+                nullptr,
                 nullptr);
         }
 
