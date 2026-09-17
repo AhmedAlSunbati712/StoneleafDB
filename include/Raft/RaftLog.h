@@ -31,6 +31,11 @@ public:
         std::span<const RaftMutationEntry> entries);
     RaftMutationEntry read(std::uint64_t index) const;
     std::vector<RaftMutationEntry> scan_from(std::uint64_t index) const;
+    // At most max_count entries starting at first_index, read through the
+    // index one entry at a time. Unlike scan_from(), the cost is bounded by
+    // max_count rather than by the size of every segment from first_index on.
+    // first_index may equal last_index() + 1, which yields nothing.
+    std::vector<RaftMutationEntry> read_range(std::uint64_t first_index, std::size_t max_count) const;
 
     std::uint64_t last_index() const noexcept;
     std::uint64_t last_term() const noexcept;

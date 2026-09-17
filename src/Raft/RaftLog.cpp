@@ -245,6 +245,29 @@ std::vector<RaftMutationEntry> RaftLog::scan_from(std::uint64_t index) const {
     return entries;
 }
 
+std::vector<RaftMutationEntry> RaftLog::read_range(
+    std::uint64_t first_index,
+    std::size_t max_count) const {
+    std::shared_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Raft log is not open");
+    if (first_index == 0 || first_index > next_index_) {
+        throw std::out_of_range("Raft range start is outside the log");
+    }
+
+    const std::uint64_t available = next_index_ - first_index;
+    const std::uint64_t count = std::min<std::uint64_t>(available, max_count);
+    std::vector<RaftMutationEntry> entries;
+    entries.reserve(static_cast<std::size_t>(count));
+
+    std::size_t segment = 0;
+    for (std::uint64_t index = first_index; index < first_index + count; ++index) {
+        // Indexes only increase, so the containing segment only moves forward.
+        while (index >= segments_[segment]->next_index()) ++segment;
+        entries.push_back(segments_[segment]->read(index));
+    }
+    return entries;
+}
+
 std::uint64_t RaftLog::last_index() const noexcept {
     std::shared_lock lock(mutex_);
     return next_index_ == 0 ? 0 : next_index_ - 1;
