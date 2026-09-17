@@ -163,6 +163,34 @@ TEST_F(RaftElectionTest, WinsWithOneGrantingPeerOfTwo) {
     EXPECT_EQ(nodes[1]->state->voted_for(), std::optional<NodeAddress>{raft_addresses[0]});
 }
 
+TEST_F(RaftElectionTest, AWinAppendsANoOpFromTheNewTerm) {
+    // Until an entry of the leader's own term commits, commit_index can lag the
+    // true committed prefix (Figure 8), so a read taken before then could miss
+    // a committed write. The no-op is what closes that window.
+    build(3, {0, 1});
+    nodes[0]->log->append(1, {});   // an inherited entry from an earlier term
+    RaftElection election(*nodes[0]->state, *nodes[0]->log, *clients);
+
+    ASSERT_TRUE(election.campaign());
+
+    ASSERT_EQ(nodes[0]->log->last_index(), 2u);
+    EXPECT_EQ(nodes[0]->log->term_at(2), term_of(0));
+    EXPECT_TRUE(nodes[0]->log->read(2).operations.empty());
+    std::lock_guard lock(nodes[0]->state->state_mutex);
+    EXPECT_EQ(nodes[0]->state->leader_term_first_index(), 2u);
+}
+
+TEST_F(RaftElectionTest, ALostCampaignAppendsNothing) {
+    build(3, {0});
+    RaftElection election(*nodes[0]->state, *nodes[0]->log, *clients);
+
+    ASSERT_FALSE(election.campaign());
+
+    EXPECT_EQ(nodes[0]->log->last_index(), 0u);
+    std::lock_guard lock(nodes[0]->state->state_mutex);
+    EXPECT_EQ(nodes[0]->state->leader_term_first_index(), 0u);
+}
+
 TEST_F(RaftElectionTest, CannotWinAloneInAThreeNodeCluster) {
     // Only node 0 is up. One vote of three is not a majority.
     build(3, {0});
