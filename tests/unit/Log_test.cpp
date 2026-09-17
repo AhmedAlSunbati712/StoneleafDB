@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+
 #include <Log/Log.h>
 
 #include <filesystem>
@@ -74,6 +76,32 @@ TEST(LogTest, SyncThroughMakesEverythingAppendedDurableAcrossSegments) {
     log.sync_through(1); EXPECT_EQ(log.durable_lsn(), 2u);
     EXPECT_NO_THROW(log.sync_through(2)); EXPECT_EQ(log.durable_lsn(), 2u);
     EXPECT_THROW(log.sync_through(3), std::out_of_range);
+}
+
+TEST(LogTest, ConcurrentSyncsEachReturnOnlyOnceTheirRecordIsDurable) {
+    // Group commit: one thread fsyncs while the rest wait and then find their
+    // record covered. None may return before its own LSN is durable.
+    TempDir dir; Config small = config(); small.max_store_bytes = 512;
+    Log log(small); log.open(dir.path.string());
+    constexpr int thread_count = 8; constexpr int records_per_thread = 25;
+    std::atomic<int> violations{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&] {
+            for (int j = 0; j < records_per_thread; ++j) {
+                const Lsn lsn = log.append(system({'x'}));
+                log.sync_through(lsn);
+                if (log.durable_lsn() < lsn) violations++;
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(violations.load(), 0);
+    EXPECT_EQ(log.durable_lsn(), static_cast<Lsn>(thread_count * records_per_thread));
+    log.close();
+
+    Log reopened(small); reopened.open(dir.path.string());
+    EXPECT_EQ(reopened.scan().size(), static_cast<std::size_t>(thread_count * records_per_thread));
 }
 
 TEST(LogTest, ConcurrentAppendsRemainUniqueAndDense) {
