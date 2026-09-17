@@ -267,7 +267,11 @@ undo executor required to finish either boundary.
 1. The atomic transition from `Active` to `Committing`.
 2. Verification that the transaction has no unfinished B+ tree action.
 3. Append of `TXN_COMMIT` through the transaction's `prevLSN` chain.
-4. WAL synchronization through the commit record.
+4. WAL synchronization through the commit record — skipped when the
+   transaction logged no B+ tree action and the record carries no Raft index.
+   Such a transaction changed nothing: if its commit record is lost in a crash,
+   recovery ends it with nothing to undo, and the client could not tell. This
+   keeps read-only transactions off the disk.
 5. The transition to `Committed`.
 6. Logical-lock and graph cleanup.
 7. Removal from the active table.
@@ -782,7 +786,8 @@ not need to recreate an earlier tree shape.
 
 Only after every inverse has a CLR and `TXN_END` is durable may
 `TransactionManager` release the transaction's logical locks and acknowledge
-abort. Page latches remain operation-scoped and are never retained through
+abort. A transaction that logged no action has no inverse, so its `TXN_END` is
+appended but not synchronized, for the same reason its commit is not. Page latches remain operation-scoped and are never retained through
 client think-time.
 
 ## Autocommit Statements

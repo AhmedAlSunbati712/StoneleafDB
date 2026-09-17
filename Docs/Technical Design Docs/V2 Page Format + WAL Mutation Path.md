@@ -970,7 +970,9 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 - `finish_mutation` appends but does not synchronize the WAL.
 - A cached after-image is never written to the database before WAL is durable
   through its `pageLSN`.
-- Commit is not acknowledged before its commit record is durable.
+- Commit is not acknowledged before its commit record is durable, unless the
+  transaction logged no action and carries no Raft index: nothing depends on
+  that record surviving a crash.
 - Database pages are not forced at commit.
 - WAL append buffers must own record bytes; they cannot retain spans into
   mutable cached pages.
