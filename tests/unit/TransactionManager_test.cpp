@@ -85,20 +85,19 @@ struct ManagerFixture {
     TransactionManager manager;
 };
 
-TEST(TransactionManagerTest, BeginCreatesOwnedTransactionAndWalRecord) {
+TEST(TransactionManagerTest, BeginCreatesOwnedTransactionWithoutWalRecord) {
     ManagerFixture fixture;
 
     const TransactionHandle transaction = fixture.manager.begin();
 
     EXPECT_EQ(transaction->id(), 1u);
     EXPECT_EQ(transaction->state(), TransactionState::Active);
-    EXPECT_EQ(transaction->last_lsn(), 1u);
     EXPECT_EQ(fixture.manager.find(transaction->id()), transaction);
 
-    const WalRecord begin = fixture.log.read(transaction->last_lsn());
-    EXPECT_EQ(begin.type, WalRecordType::TxnBegin);
-    EXPECT_EQ(begin.transaction_id, transaction->id());
-    EXPECT_EQ(begin.prev_lsn, 0u);
+    // TXN_BEGIN is deferred to the first logged action: a transaction that
+    // only reads or holds locks never touches the WAL.
+    EXPECT_EQ(transaction->last_lsn(), 0u);
+    EXPECT_TRUE(fixture.log.scan().empty());
 
     EXPECT_EQ(
         fixture.manager.abort(transaction, AbortReason::ClientRequest),
@@ -108,7 +107,7 @@ TEST(TransactionManagerTest, BeginCreatesOwnedTransactionAndWalRecord) {
 TEST(TransactionManagerTest, CommitMakesDecisionDurableAndRemovesTransaction) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{KeyCodec::make_string("key")});
     action.add_effect(effect(7, 'a'));
     const Lsn action_lsn = fixture.manager.append_action(transaction, action.build());
@@ -130,6 +129,10 @@ TEST(TransactionManagerTest, CommitMakesDecisionDurableAndRemovesTransaction) {
 TEST(TransactionManagerTest, AbortWritesDecisionAndEnd) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
+    action.set_undo(InsertUndo{KeyCodec::make_string("key")});
+    action.add_effect(effect(7, 'a'));
+    fixture.manager.append_action(transaction, action.build());
 
     EXPECT_EQ(
         fixture.manager.abort(transaction, AbortReason::StatementFailure),
@@ -139,30 +142,32 @@ TEST(TransactionManagerTest, AbortWritesDecisionAndEnd) {
     EXPECT_FALSE(fixture.manager.find(transaction->id()));
 
     const std::vector<WalRecord> records = fixture.log.scan();
-    ASSERT_EQ(records.size(), 3u);
+    ASSERT_EQ(records.size(), 5u);
     EXPECT_EQ(records[0].type, WalRecordType::TxnBegin);
-    EXPECT_EQ(records[1].type, WalRecordType::TxnAbort);
-    EXPECT_EQ(records[2].type, WalRecordType::TxnEnd);
-    EXPECT_EQ(records[2].prev_lsn, records[1].lsn);
+    EXPECT_EQ(records[1].type, WalRecordType::BTreeAction);
+    EXPECT_EQ(records[2].type, WalRecordType::TxnAbort);
+    EXPECT_EQ(records[3].type, WalRecordType::Compensation);
+    EXPECT_EQ(records[4].type, WalRecordType::TxnEnd);
     EXPECT_EQ(
-        std::get<AbortPayload>(WalRecords::decode(records[1])).reason,
+        std::get<AbortPayload>(WalRecords::decode(records[2])).reason,
         AbortReason::StatementFailure);
 }
 
-// A transaction that logged no action has nothing to redo or undo, so its
-// decision need not be durable: after a crash recovery ends it and nothing
-// else. Skipping the sync is what keeps a read off the disk.
-TEST(TransactionManagerTest, CommitOfATransactionThatWroteNothingDoesNotSync) {
+// A transaction that logged no action has nothing to redo or undo, so it
+// writes no WAL at all - no begin, no decision, no sync. That keeps reads, and
+// the replicated path's lock-only session transactions, off the log entirely.
+TEST(TransactionManagerTest, CommitOfATransactionThatWroteNothingWritesNoWal) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
     EXPECT_EQ(fixture.manager.commit(transaction), CommitStatus::Success);
 
     EXPECT_EQ(transaction->state(), TransactionState::Committed);
-    EXPECT_LT(fixture.log.durable_lsn(), transaction->last_lsn());
+    EXPECT_FALSE(fixture.manager.find(transaction->id()));
+    EXPECT_TRUE(fixture.log.scan().empty());
 }
 
-TEST(TransactionManagerTest, AbortOfATransactionThatWroteNothingDoesNotSync) {
+TEST(TransactionManagerTest, AbortOfATransactionThatWroteNothingWritesNoWal) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
@@ -171,24 +176,53 @@ TEST(TransactionManagerTest, AbortOfATransactionThatWroteNothingDoesNotSync) {
         AbortStatus::Success);
 
     EXPECT_EQ(transaction->state(), TransactionState::Aborted);
-    EXPECT_LT(fixture.log.durable_lsn(), transaction->last_lsn());
+    EXPECT_FALSE(fixture.manager.find(transaction->id()));
+    EXPECT_TRUE(fixture.log.scan().empty());
+}
+
+TEST(TransactionManagerTest, PrepareToLogWritesTheDeferredBeginOnceAndActionsChainToIt) {
+    ManagerFixture fixture;
+    const TransactionHandle transaction = fixture.manager.begin();
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
+    action.set_undo(InsertUndo{KeyCodec::make_string("key")});
+    action.add_effect(effect(7, 'a'));
+
+    // A second call must not write a second begin.
+    EXPECT_EQ(fixture.manager.prepare_to_log(transaction), 1u);
+    const Lsn action_lsn = fixture.manager.append_action(transaction, action.build());
+
+    const std::vector<WalRecord> records = fixture.log.scan();
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[0].type, WalRecordType::TxnBegin);
+    EXPECT_EQ(records[0].transaction_id, transaction->id());
+    EXPECT_EQ(records[0].prev_lsn, 0u);
+    EXPECT_EQ(records[1].lsn, action_lsn);
+    EXPECT_EQ(records[1].prev_lsn, records[0].lsn);
+    EXPECT_EQ(transaction->last_lsn(), action_lsn);
+
+    EXPECT_EQ(fixture.manager.commit(transaction), CommitStatus::Success);
 }
 
 // A Raft index in the commit record is state recovery depends on - it is the
-// applied watermark - so it syncs even with no action.
-TEST(TransactionManagerTest, CommitCarryingARaftIndexSyncsEvenWithoutActions) {
+// applied watermark - so it is logged, and synced, even with no action.
+TEST(TransactionManagerTest, CommitCarryingARaftIndexIsLoggedAndSyncedWithoutActions) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
     EXPECT_EQ(fixture.manager.commit(transaction, Durability::Sync, 7), CommitStatus::Success);
 
+    const std::vector<WalRecord> records = fixture.log.scan();
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[0].type, WalRecordType::TxnBegin);
+    EXPECT_EQ(records[1].type, WalRecordType::TxnCommit);
+    EXPECT_EQ(std::get<CommitPayload>(WalRecords::decode(records[1])).raft_index, 7u);
     EXPECT_GE(fixture.log.durable_lsn(), transaction->last_lsn());
 }
 
 TEST(TransactionManagerTest, AbortAfterAnActionMakesTheEndDurable) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{KeyCodec::make_string("key")});
     action.add_effect(effect(7, 'a'));
     fixture.manager.append_action(transaction, action.build());
@@ -204,7 +238,7 @@ TEST(TransactionManagerTest, AbortUndoesActionsAndChainsCompensationRecord) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{KeyCodec::make_string("key")});
     action.add_effect(effect(7, 'a'));
     const Lsn action_lsn = fixture.manager.append_action(transaction, action.build());
@@ -237,7 +271,7 @@ TEST(TransactionManagerTest, AppendActionValidatesTransactionWalChain) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), fixture.manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{KeyCodec::make_string("key")});
     action.add_effect(effect(7, 'a'));
     PendingWalRecord pending = action.build();
@@ -246,6 +280,7 @@ TEST(TransactionManagerTest, AppendActionValidatesTransactionWalChain) {
     EXPECT_THROW(
         fixture.manager.append_action(transaction, std::move(pending)),
         std::invalid_argument);
+    // Rejected: only the begin that prepare_to_log wrote is in the log.
     EXPECT_EQ(transaction->last_lsn(), 1u);
     EXPECT_EQ(fixture.log.next_lsn(), 2u);
 
@@ -314,7 +349,8 @@ TEST(TransactionManagerTest, ReopenContinuesAfterGreatestTransactionId) {
         TransactionManager manager(log, first_lock_manager, first_undo_executor);
         const TransactionHandle transaction = manager.begin();
         EXPECT_EQ(transaction->id(), 1u);
-        EXPECT_EQ(manager.commit(transaction), CommitStatus::Success);
+        // A Raft index forces the transaction into the WAL, where reopen finds it.
+        EXPECT_EQ(manager.commit(transaction, Durability::Sync, 1), CommitStatus::Success);
         log.close();
     }
 

@@ -34,12 +34,13 @@ TransactionHandle TransactionManager::begin() {
     const TransactionId txn_id = next_transaction_id_;
     TransactionHandle transaction = std::make_shared<Transaction>(txn_id);
 
-    // Add the in-memory state before writing WAL so allocation failures do not
-    // leave a begin record without a transaction owned by this manager.
+    // TXN_BEGIN is not written here: append_action() writes it before the
+    // transaction's first action. Most transactions never log one - reads, and
+    // the replicated path's sessions, which only hold locks - and every WAL
+    // append they skipped would otherwise stall behind the WAL's fsync.
     active_transactions_.emplace(txn_id, transaction);
     try {
         wait_for_graph_.add_node(txn_id);
-        transaction->last_lsn_ = log_.append(WalRecords::begin(txn_id));
     } catch (...) {
         wait_for_graph_.remove(txn_id);
         active_transactions_.erase(txn_id);
@@ -60,6 +61,21 @@ TransactionHandle TransactionManager::find(TransactionId txn_id) const {
 bool TransactionManager::has_active_transactions() const noexcept {
     std::shared_lock lock(transactions_mutex_);
     return !active_transactions_.empty();
+}
+
+Lsn TransactionManager::prepare_to_log(const TransactionHandle& transaction) {
+    std::shared_lock lock(transactions_mutex_);
+    if (!owns_handle_locked(transaction)) {
+        throw std::invalid_argument("Transaction is not owned by this manager");
+    }
+    if (transaction->state_ != TransactionState::Active) {
+        throw std::logic_error("Transaction is not active");
+    }
+    // Like append_action, this mutates only the owning thread's transaction.
+    if (transaction->last_lsn_ == 0) {
+        transaction->last_lsn_ = log_.append(WalRecords::begin(transaction->id_));
+    }
+    return transaction->last_lsn_;
 }
 
 Lsn TransactionManager::append_action(const TransactionHandle& transaction, PendingWalRecord action) {
@@ -98,16 +114,21 @@ CommitStatus TransactionManager::commit(const TransactionHandle& transaction,
         transaction->state_ = TransactionState::Committing;
     }
 
-    // A commit decision is acknowledged only after its WAL record is durable.
-    const Lsn commit_lsn = log_.append(
-        WalRecords::commit(transaction->id_, transaction->last_lsn_, raft_index));
-    transaction->last_lsn_ = commit_lsn;
-    // A transaction that logged no action changed nothing, so losing its
-    // commit record in a crash loses nothing - unless the record carries a
-    // Raft index, which recovery reads back as the applied watermark.
+    // A transaction that logged no action changed nothing, so it needs no
+    // decision record at all - unless the record carries a Raft index, which
+    // recovery reads back as the applied watermark. Every commit that is
+    // written is acknowledged only after it is durable.
+    // A begin logged ahead of an action that never came (a delete of an absent
+    // key) still gets its commit, so recovery does not treat it as a loser.
     const bool decision_matters = transaction->logged_action_ || raft_index != 0;
-    if (durability == Durability::Sync && decision_matters) {
-        log_.sync_through(commit_lsn);
+    if (decision_matters || transaction->last_lsn_ != 0) {
+        if (transaction->last_lsn_ == 0) {
+            transaction->last_lsn_ = log_.append(WalRecords::begin(transaction->id_));
+        }
+        const Lsn commit_lsn = log_.append(
+            WalRecords::commit(transaction->id_, transaction->last_lsn_, raft_index));
+        transaction->last_lsn_ = commit_lsn;
+        if (durability == Durability::Sync && decision_matters) log_.sync_through(commit_lsn);
     }
 
     {
@@ -140,6 +161,19 @@ AbortStatus TransactionManager::abort(const TransactionHandle& transaction, Abor
         // rollback begins with the last record that may require undo.
         transaction->state_ = TransactionState::Aborting;
         undo_lsn = transaction->last_lsn_;
+    }
+
+    // Nothing logged means nothing to undo and no chain to close: the WAL
+    // never learned this transaction existed.
+    if (undo_lsn == 0) {
+        {
+            std::unique_lock lock(transactions_mutex_);
+            transaction->state_ = TransactionState::Aborted;
+        }
+        release_locks(*transaction);
+        wait_for_graph_.remove(transaction->id_);
+        remove_transaction(transaction->id_);
+        return AbortStatus::Success;
     }
 
     const Lsn abort_lsn = log_.append(WalRecords::abort(transaction->id_, transaction->last_lsn_, reason));
@@ -207,8 +241,8 @@ AbortStatus TransactionManager::abort(const TransactionHandle& transaction, Abor
     // two-phase locks are released and the transaction disappears.
     const Lsn end_lsn = log_.append(WalRecords::end(transaction->id_, transaction->last_lsn_));
     transaction->last_lsn_ = end_lsn;
-    // With no action there was nothing to undo, and recovery ends an
-    // unfinished transaction the same way, so the end need not be durable.
+    // A begin with no action had nothing to undo; recovery would end it the
+    // same way, so only an end that closes real undo work must be durable.
     if (transaction->logged_action_) log_.sync_through(end_lsn);
 
     {
