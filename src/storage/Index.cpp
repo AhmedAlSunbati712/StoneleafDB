@@ -145,8 +145,13 @@ void Index::truncate_to(std::uint64_t entry_count) {
 }
 
 void Index::sync() {
-    std::unique_lock lock(mutex_);
-    disk::sync_file_to_disk_fd(fd_);
+    // As Store::sync: fsync outside the lock, so appends proceed meanwhile.
+    int fd = -1;
+    {
+        std::shared_lock lock(mutex_);
+        fd = fd_;
+    }
+    disk::sync_file_to_disk_fd(fd);
 }
 
 std::uint64_t Index::size() const {

@@ -41,8 +41,10 @@ struct IndexScanResult {
 /// `repair_tail()` truncates it. A corrupt complete entry requires a later
 /// rebuild from the authoritative Store and cannot be repaired here.
 ///
-/// Reads may run concurrently. Append, repair, and synchronization are
-/// serialized. Segment owns the dense-sequence invariant; this lower-level
+/// Reads may run concurrently. Append and repair are serialized; synchronization
+/// runs alongside them and covers every append that returned before it was
+/// called. The owner must not close the Index while a sync is in flight.
+/// Segment owns the dense-sequence invariant; this lower-level
 /// file layer encodes the ordinal supplied by its caller. Append does not
 /// make an entry crash-durable; the caller uses `sync()` at the appropriate
 /// caller's durability boundary.

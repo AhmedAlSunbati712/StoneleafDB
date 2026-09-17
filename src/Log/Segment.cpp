@@ -127,10 +127,14 @@ std::vector<WalRecord> Segment::scan() const {
 }
 
 void Segment::sync() {
-    std::unique_lock lock(mutex_);
-    if (recovery_required_) {
-        throw std::runtime_error("Segment must be recovered before synchronization");
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Segment must be recovered before synchronization");
+        }
     }
+    // Not held across the fsyncs below: a concurrent append only adds bytes
+    // beyond what the caller asked to make durable.
 
     // Preserve the same authority ordering used by append: once the derived
     // Index is durable, every entry it contains must have durable Store bytes.

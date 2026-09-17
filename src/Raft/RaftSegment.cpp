@@ -117,10 +117,13 @@ void RaftSegment::truncate_suffix(std::uint64_t from_index) {
 }
 
 void RaftSegment::sync() {
-    std::unique_lock lock(mutex_);
-    if (recovery_required_) {
-        throw std::runtime_error("Raft segment must be recovered before synchronization");
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Raft segment must be recovered before synchronization");
+        }
     }
+    // As Segment::sync: the fsyncs run with the lock released.
     store_.sync();
     index_.sync();
 }
