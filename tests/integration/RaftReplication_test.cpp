@@ -223,6 +223,30 @@ TEST_F(ReplicationTest, EntriesReachAFollowersLog) {
     EXPECT_EQ(nodes[2]->log->last_index(), 0u);
 }
 
+TEST_F(ReplicationTest, ReplicationContinuesAcrossASegmentRollover) {
+    // raft_config() rolls a segment every 1000 entries. Batches are read and
+    // appended one entry at a time across that boundary on both sides.
+    build(3);
+    make_leader();
+    constexpr std::uint64_t entry_count = 1100;
+    for (std::uint64_t i = 1; i <= entry_count; ++i) {
+        nodes[0]->log->append(1, {put_op(i, "a")});
+    }
+    nodes[0]->log->sync_through(entry_count);
+
+    std::uint64_t attempts = 0;
+    while (nodes[1]->log->last_index() < entry_count && attempts < 200) {
+        replicators[0]->replicate_once();
+        ++attempts;
+    }
+
+    ASSERT_EQ(nodes[1]->log->last_index(), entry_count) << "after " << attempts << " attempts";
+    EXPECT_EQ(nodes[1]->log->durable_index(), entry_count);
+    EXPECT_EQ(nodes[1]->log->read(1000).idx, 1000u);
+    EXPECT_EQ(nodes[1]->log->read(1001).idx, 1001u);
+    EXPECT_EQ(commit_index_of(0), entry_count);
+}
+
 TEST_F(ReplicationTest, CommitIndexAdvancesOnceAMajorityHoldsTheEntry) {
     build(3);
     nodes[0]->log->append(1, {put_op(1, "one")});
