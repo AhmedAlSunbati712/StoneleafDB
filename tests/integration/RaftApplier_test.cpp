@@ -193,6 +193,28 @@ TEST_F(RaftApplierTest, BacklogIsAppliedAcrossSeveralBatches) {
     EXPECT_EQ(last_applied(), 5u);
 }
 
+TEST_F(RaftApplierTest, AppliesEnoughDistinctKeysToSplitLeaves) {
+    // Enough keys to split leaves through the apply path. Values stay one byte:
+    // splits are triggered by key count, not bytes, so larger cells overflow a
+    // page before it splits (no overflow pages yet).
+    constexpr std::uint64_t key_count = 1000;
+    std::vector<std::vector<MutationOp>> entries;
+    for (std::uint64_t id = 0; id < key_count; ++id) {
+        entries.push_back({put_op(id, std::string(1, static_cast<char>('a' + id % 26)))});
+    }
+    append_and_commit(entries);
+
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    std::size_t applied = 0;
+    while (std::size_t batch = applier.apply_pending_batch()) applied += batch;
+
+    EXPECT_EQ(applied, key_count);
+    EXPECT_EQ(last_applied(), key_count);
+    for (std::uint64_t id = 0; id < key_count; ++id) {
+        expect_value(id, std::string(1, static_cast<char>('a' + id % 26)));
+    }
+}
+
 TEST_F(RaftApplierTest, AppliesAKeyAnotherTransactionHoldsExclusively) {
     // The leader's proposing session still holds X on this key while the entry
     // applies. With Locking::Acquire the applier would block on it forever.
