@@ -156,7 +156,13 @@ class RaftState {
         // Opens the next round and returns its number. The caller notifies
         // replication_cv so the replication threads heartbeat immediately
         // rather than at the next HEARTBEAT_INTERVAL.
-        std::uint64_t start_read_round() noexcept { return ++read_round_; }
+        std::uint64_t start_read_round() noexcept {
+            ++read_round_;
+            // A single-node cluster has no peer to ask: the leader alone is the
+            // majority, so the round is confirmed the moment it opens.
+            if (cluster_size_ == 1) confirmed_read_round_ = read_round_;
+            return read_round_;
+        }
 
         // One peer's reply to round `round`. A reply proves that peer still
         // recognized this term, which is what leadership confirmation needs -

@@ -122,6 +122,7 @@ void RaftState::become_follower(std::uint64_t new_term,
     state_ = State::Follower;
     reset_election_timer();
     election_cv.notify_all();
+    read_cv.notify_all();   // waiting readers must be told to give up, not stall
 }
 
 std::optional<NodeAddress> RaftState::leader_client_address() const {

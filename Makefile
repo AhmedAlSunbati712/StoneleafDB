@@ -54,6 +54,7 @@ SRC = \
 	src/Raft/ClusterConfig.cpp \
 	src/Raft/RaftCommitIndex.cpp \
 	src/Raft/RaftProposer.cpp \
+	src/Raft/RaftReadIndex.cpp \
 	src/Raft/TransactionWriteBuffer.cpp \
 	src/storage/Index.cpp \
 	src/Log/Segment.cpp \
@@ -101,6 +102,7 @@ OBJ = \
 	build/Raft/ClusterConfig.o \
 	build/Raft/RaftCommitIndex.o \
 	build/Raft/RaftProposer.o \
+	build/Raft/RaftReadIndex.o \
 	build/Raft/TransactionWriteBuffer.o \
 	build/storage/Index.o \
 	build/Log/Segment.o \

@@ -29,6 +29,7 @@ void advance_commit_index(RaftState& state, RaftLog& raft_log) {
         if (replicas >= majority) {
             state.set_commit_index(n);
             state.apply_cv.notify_one();   // single waiter: the apply loop
+            state.read_cv.notify_all();    // readers waiting for the leadership no-op
             break;
         }
     }
