@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -245,6 +246,42 @@ TEST_F(ReplicationTest, ReplicationContinuesAcrossASegmentRollover) {
     EXPECT_EQ(nodes[1]->log->read(1000).idx, 1000u);
     EXPECT_EQ(nodes[1]->log->read(1001).idx, 1001u);
     EXPECT_EQ(commit_index_of(0), entry_count);
+}
+
+TEST_F(ReplicationTest, ReplicationDoesNotWaitForAnInFlightAppend) {
+    // A leader's append runs under append_mutex, not state_mutex. Heartbeats
+    // and replication must keep going while one is in progress - on a shared
+    // volume that write can stall for milliseconds.
+    build(3);
+    nodes[0]->log->append(1, {put_op(1, "a")});
+    nodes[0]->log->sync_through(1);
+    make_leader();
+
+    std::unique_lock held(nodes[0]->state->append_mutex);
+    auto round = std::async(std::launch::async, [&] { return replicate_until_caught_up(0); });
+    ASSERT_EQ(round.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(round.get());
+    EXPECT_EQ(nodes[1]->log->last_index(), 1u);
+}
+
+TEST_F(ReplicationTest, TheAppendEntriesReceiverWaitsForAnInFlightAppend) {
+    // A proposal on the receiving node - a leader just deposed - must not
+    // append between the receiver's consistency check and its truncation.
+    // Leader first, so send_next starts at 1 and the RPC carries the entry.
+    build(3);
+    make_leader();
+    nodes[0]->log->append(1, {put_op(1, "a")});
+    nodes[0]->log->sync_through(1);
+
+    {
+        std::unique_lock held(nodes[1]->state->append_mutex);
+        replicators[0]->replicate_once();   // times out against the blocked handler
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        EXPECT_EQ(nodes[1]->log->last_index(), 0u);
+    }
+
+    EXPECT_TRUE(replicate_until_caught_up(0));
+    EXPECT_EQ(nodes[1]->log->last_index(), 1u);
 }
 
 TEST_F(ReplicationTest, CommitIndexAdvancesOnceAMajorityHoldsTheEntry) {
