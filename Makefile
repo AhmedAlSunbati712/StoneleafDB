@@ -292,7 +292,7 @@ build/tests/integration/RaftElection_test: build/tests/integration/RaftElection_
 # Replication needs everything elections need, plus the replicator and the
 # propose path, and it drives real state machines through the apply loop.
 build/tests/integration/RaftReplication_test: CXXFLAGS += -pthread
-build/tests/integration/RaftReplication_test: build/tests/integration/RaftReplication_test.o build/Raft/RaftReplicator.o build/Raft/RaftElection.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
+build/tests/integration/RaftReplication_test: build/tests/integration/RaftReplication_test.o build/server/CommandServer.o build/Raft/RaftReplicator.o build/Raft/RaftElection.o build/Raft/RaftServiceImpl.o build/Raft/RaftProtoCodec.o build/Raft/RaftPeerClients.o $(GEN_DIR)/raft.pb.o $(GEN_DIR)/raft.grpc.pb.o $(LIB)
 	mkdir -p $(dir $@)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS) $(GRPC_LDLIBS) -pthread
 

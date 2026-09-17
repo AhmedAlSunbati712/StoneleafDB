@@ -13,7 +13,9 @@
 #include <Raft/RaftServiceImpl.h>
 #include <Raft/RaftState.h>
 #include <Raft/TransactionWriteBuffer.h>
+#include <Session.h>
 #include <ValueCodec.h>
+#include <server/CommandServer.h>
 #include <storage/Index.h>
 
 #include <arpa/inet.h>
@@ -424,6 +426,31 @@ TEST_F(SingleNodeReplicationTest, TheWriteBufferCollapsesRepeatedWritesToOneKey)
     EXPECT_EQ(ValueCodec::decode(*result.value),
               std::optional<ValueInput>{ValueInput{std::string{"second"}}});
     ASSERT_EQ(transaction_manager->commit(transaction), CommitStatus::Success);
+}
+
+TEST_F(SingleNodeReplicationTest, AReadOnlyTransactionCommitsWithoutProposing) {
+    RaftProposer proposer(*state, *raft_log);
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    std::thread dispatcher(CommandServer::serve_connection, sockets[1],
+                           std::ref(store), std::ref(*transaction_manager), &proposer);
+    {
+        Session session(sockets[0], 0);
+        session.begin_transaction();
+        session.put(KeyInput{std::uint64_t{1}}, ValueInput{std::string{"a"}});
+        session.commit();
+        const std::uint64_t entries_after_write = raft_log->last_index();
+
+        // Nothing buffered, so there is nothing to replicate: COMMIT must
+        // succeed and must not append an entry to the Raft log.
+        session.begin_transaction();
+        EXPECT_EQ(session.get(KeyInput{std::uint64_t{1}}),
+                  std::optional<ValueInput>{ValueInput{std::string{"a"}}});
+        EXPECT_NO_THROW(session.commit());
+        EXPECT_EQ(raft_log->last_index(), entries_after_write);
+        session.close();
+    }
+    dispatcher.join();
 }
 
 } // namespace
