@@ -225,6 +225,19 @@ void execute_replicated_command(
             send_operation_response(socket_fd, KeyStoreStatus::NoActiveTransaction);
             return;
         }
+        if (context.write_buffer.empty()) {
+            // A read-only transaction has nothing to replicate. Proposing an
+            // empty entry would cost a Raft round trip, and on a follower it
+            // would be rejected outright - so reads commit locally, anywhere.
+            const CommitStatus status = transaction_manager.commit(context.active_transaction);
+            context.active_transaction.reset();
+            send_operation_response(
+                socket_fd,
+                status == CommitStatus::Success
+                    ? KeyStoreStatus::Success
+                    : KeyStoreStatus::CommitFailed);
+            return;
+        }
         send_operation_response(
             socket_fd,
             propose_and_settle(context, transaction_manager, proposer));
