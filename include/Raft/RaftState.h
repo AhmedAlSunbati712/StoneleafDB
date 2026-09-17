@@ -163,7 +163,12 @@ class RaftState {
         // open_read_round() when they build their next request; the caller
         // notifies replication_cv so that happens now rather than at the next
         // HEARTBEAT_INTERVAL.
-        void request_read_round() noexcept {
+        // Returns true if this call is what marked a round wanted, so only one
+        // reader of a wave notifies the replication threads: with dozens of
+        // readers, notify_all() per reader is itself enough contention on
+        // state_mutex to delay heartbeats.
+        bool request_read_round() noexcept {
+            const bool newly_requested = !read_round_wanted_;
             read_round_wanted_ = true;
             // A single-node cluster has no peer to ask: the leader alone is the
             // majority, so the round opens and confirms immediately.
@@ -173,6 +178,7 @@ class RaftState {
                 read_round_wanted_ = false;
                 read_cv.notify_all();
             }
+            return newly_requested;
         }
         bool read_round_wanted() const noexcept { return read_round_wanted_; }
 
