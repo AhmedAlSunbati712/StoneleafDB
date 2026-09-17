@@ -383,7 +383,8 @@ void RaftLog::sync_through(std::uint64_t index) {
     lock.unlock();
 
     try {
-        for (RaftSegment* segment : to_sync) segment->sync();
+        // Store only; see Log::sync_through.
+        for (RaftSegment* segment : to_sync) segment->sync_store();
         if (sync_directory) disk::sync_directory(directory);
     } catch (...) {
         lock.lock();

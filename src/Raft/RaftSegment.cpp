@@ -128,6 +128,16 @@ void RaftSegment::sync() {
     index_.sync();
 }
 
+void RaftSegment::sync_store() {
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Raft segment must be recovered before synchronization");
+        }
+    }
+    store_.sync();
+}
+
 bool RaftSegment::is_maxed() const {
     std::shared_lock lock(mutex_);
     return store_.size() > config_.max_store_bytes ||

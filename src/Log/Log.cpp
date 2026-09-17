@@ -184,10 +184,11 @@ void Log::sync_through(Lsn target_lsn) {
 
     // Appends continue while the disk works. Segments are only destroyed by
     // close(), which waits for sync_in_progress_ to clear, so these pointers
-    // stay valid. Authority order is preserved: older segments first, and
-    // Segment::sync writes Store before Index.
+    // stay valid. Older segments are synced first.
     try {
-        for (Segment* segment : to_sync) segment->sync();
+        // Store only: a synced record's Index entry is rebuilt by recovery if
+        // it is lost, so the Index costs a full sync here for nothing.
+        for (Segment* segment : to_sync) segment->sync_store();
     } catch (...) {
         lock.lock();
         sync_in_progress_ = false;

@@ -142,6 +142,16 @@ void Segment::sync() {
     index_.sync();
 }
 
+void Segment::sync_store() {
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Segment must be recovered before synchronization");
+        }
+    }
+    store_.sync();
+}
+
 bool Segment::is_maxed() const {
     std::shared_lock lock(mutex_);
 
