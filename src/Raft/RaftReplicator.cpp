@@ -55,6 +55,7 @@ bool RaftReplicator::replicate_once() {
     std::uint64_t prev_index = 0;
     std::uint64_t prev_term = 0;
     std::uint64_t leader_commit = 0;
+    std::uint64_t sent_read_round = 0;
     NodeAddress self;
     std::vector<RaftMutationEntry> entries;
 
@@ -65,6 +66,9 @@ bool RaftReplicator::replicate_once() {
         sent_term = state_.current_term();
         self = state_.self_raft_address();
         leader_commit = state_.commit_index();
+        // Read by the round the reply will be credited to, not at reply time: a
+        // round that opens while this RPC is in flight is not confirmed by it.
+        sent_read_round = state_.read_round();
 
         // send_next and replicated_index are only populated for the current
         // leadership, which the state check above guarantees we hold.
@@ -119,6 +123,11 @@ bool RaftReplicator::replicate_once() {
     if (sent_term != state_.current_term() || state_.state() != State::Leader) {
         return false;
     }
+
+    // The peer answered in our term. That is what a read-index confirmation
+    // needs - it proves the peer still recognizes this leadership - and holds
+    // whether or not the entries were accepted below.
+    state_.record_read_ack(peer_, sent_read_round);
 
     if (!response.success()) {
         // The follower's log diverges at prev_index. Back up one and retry;
