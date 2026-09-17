@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 // ARIES recovery over the WAL. Lives in the library rather than beside main()
 // so tests can drive it directly, the way setup_database() does.
@@ -25,3 +26,12 @@ void aries_recovery_redo(Log& log,
 void aries_recovery_undo(Log& log,
     KeyStore& key_store,
     std::unordered_map<TransactionId, Lsn>& unresolved_transactions);
+
+// Returns {base_lsn, is_store} for a WAL segment file name. A name starting
+// with "segment-" must have the exact "<20 digits>.store" or
+// "<20 digits>.index" shape, or it throws; any other name returns {0, false}.
+std::pair<std::uint64_t, bool> parse_wal_segment_name(const std::string& name);
+
+// Deletes every WAL segment except the active one. Only safe once undo has
+// flushed every page it dirtied to the database file.
+void cleanup_finalized_segments(const std::string& db_file_name);

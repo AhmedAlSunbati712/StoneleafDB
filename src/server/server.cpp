@@ -52,22 +52,6 @@ enum class StartupStatus : std::uint8_t {
     FAILED,
 };
 
-// Returns {base_lsn, is_store}. Mirrors Log.cpp's own parse_segment_name:
-// a name starting with "segment-" must have the exact "<20 digits>.store" or
-// "<20 digits>.index" shape, or it's treated as corruption, not ignored.
-std::pair<std::uint64_t, bool> parse_segment_offset(const std::string& name) {
-    constexpr std::size_t prefix_size = 8;
-    constexpr std::size_t digits_size = 20;
-    if (!name.starts_with("segment-")) return {0, false};
-    const bool store = name.size() == prefix_size + digits_size + 6 && name.ends_with(".store");
-    const bool index = name.size() == prefix_size + digits_size + 6 && name.ends_with(".index");
-    if (!store && !index) throw std::runtime_error("Malformed WAL segment filename");
-    const auto digits = name.substr(prefix_size, digits_size);
-    if (digits.find_first_not_of("0123456789") != std::string::npos) throw std::runtime_error("Malformed WAL segment filename");
-    try { return {std::stoull(digits), store}; }
-    catch (...) { throw std::runtime_error("Malformed WAL segment filename"); }
-}
-
 Config setup_config(const std::string& database_directory) {
     // Log::open() requires initial_lsn to equal the smallest existing
     // segment's base LSN when segments already exist. A fresh database (no
@@ -79,7 +63,7 @@ Config setup_config(const std::string& database_directory) {
     if (std::filesystem::exists(wal_directory)) {
         for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
             const auto name = entry.path().filename().string();
-            const auto [base, is_store] = parse_segment_offset(name);
+            const auto [base, is_store] = parse_wal_segment_name(name);
             // Every segment has exactly one .store file, so counting only
             // those naturally avoids double-counting its paired .index file.
             if (!is_store) continue;
@@ -94,40 +78,6 @@ Config setup_config(const std::string& database_directory) {
     };
 }
 
-
-// Deletes every WAL segment that isn't the currently active one. Safe only
-// once redo has replayed the entire retained log onto the database file and
-// flush() has made every page undo dirtied durable there too - at that
-// point nothing outside the active segment is needed to recover again, even
-// if the active segment rolled over partway through the undo pass.
-void cleanup_finalized_segments(const std::string& db_file_name) {
-    const std::string wal_directory = db_file_name + ".wal";
-    if (!std::filesystem::exists(wal_directory)) return;
-
-    // The active segment is the one with the largest base LSN - segments are
-    // created with strictly increasing base LSNs, and Log always appends
-    // into the most recently created one.
-    std::optional<std::uint64_t> active_base;
-    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("segment-")) continue;
-        const auto [base, is_store] = parse_segment_offset(name);
-        if (!is_store) continue;
-        if (!active_base || base > *active_base) active_base = base;
-    }
-    // No segments at all means nothing to clean up.
-    if (!active_base) return;
-
-    // Delete both the .store and .index file for every non-active base LSN.
-    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("segment-")) continue;
-        const auto [base, is_store] = parse_segment_offset(name);
-        (void)is_store;
-        if (base == *active_base) continue;
-        std::filesystem::remove(entry.path());
-    }
-}
 
 // KeyStore, Log, and TransactionManager all have deleted copy/move
 // constructors, so they can't be built here and handed back by value - the
