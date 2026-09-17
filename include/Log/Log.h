@@ -4,6 +4,7 @@
 #include <Log/Segment.h>
 #include <Log/WalRecord.h>
 
+#include <condition_variable>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -43,5 +44,12 @@ private:
     bool recovery_required_ = false;
     mutable std::shared_mutex mutex_;
 
+    // Group commit: at most one thread fsyncs at a time, with mutex_ released.
+    // It makes durable everything appended when it started, so callers that
+    // arrive meanwhile wait on sync_done_ and usually find their LSN covered.
+    bool sync_in_progress_ = false;
+    std::condition_variable_any sync_done_;
+
     void create_segment(Lsn base_lsn);
+    void wait_for_sync_to_finish(std::unique_lock<std::shared_mutex>& lock);
 };

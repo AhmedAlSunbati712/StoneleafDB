@@ -64,13 +64,15 @@ TEST(LogTest, RollsBeforeAppendAfterARecordCrossesLimit) {
     auto records = log.scan(); ASSERT_EQ(records.size(), 2u); EXPECT_EQ(records[1].lsn, 2u);
 }
 
-TEST(LogTest, SyncThroughTracksWholeSegmentDurability) {
+TEST(LogTest, SyncThroughMakesEverythingAppendedDurableAcrossSegments) {
+    // One record per segment. A sync for the first also takes the second:
+    // it is already written, and the same round of fsyncs covers it.
     TempDir dir; Config small = config(); small.max_store_bytes = 44;
     Log log(small); log.open(dir.path.string());
     log.append(system({'a'})); log.append(system({'b'}));
     EXPECT_EQ(log.durable_lsn(), 0u);
-    log.sync_through(1); EXPECT_EQ(log.durable_lsn(), 1u);
-    log.sync_through(2); EXPECT_EQ(log.durable_lsn(), 2u);
+    log.sync_through(1); EXPECT_EQ(log.durable_lsn(), 2u);
+    EXPECT_NO_THROW(log.sync_through(2)); EXPECT_EQ(log.durable_lsn(), 2u);
     EXPECT_THROW(log.sync_through(3), std::out_of_range);
 }
 

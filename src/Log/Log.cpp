@@ -4,6 +4,7 @@
 #include <Log/WalRecordCodec.h>
 
 #include <fcntl.h>
+#include <algorithm>
 #include <filesystem>
 #include <iomanip>
 #include <map>
@@ -40,6 +41,7 @@ Log::Log(Config config) : config_(config) { config_.validate(); }
 
 Log::~Log() noexcept {
     std::unique_lock lock(mutex_);
+    wait_for_sync_to_finish(lock);
     segments_.clear();
 }
 
@@ -93,6 +95,8 @@ void Log::open(const std::string& directory) {
 
 void Log::close() {
     std::unique_lock lock(mutex_);
+    // An in-flight sync holds raw pointers into segments_.
+    wait_for_sync_to_finish(lock);
     if (segments_.empty()) return;
     if (recovery_required_) throw std::runtime_error("Log must be reopened and recovered before close can synchronize");
     for (auto& segment : segments_) segment->sync();
@@ -155,18 +159,50 @@ void Log::sync_through(Lsn target_lsn) {
     if (segments_.empty()) throw std::runtime_error("Log is not open");
     if (recovery_required_) throw std::runtime_error("Log must be reopened and recovered before synchronization");
     if (target_lsn < config_.initial_lsn || target_lsn >= next_lsn_) throw std::out_of_range("Target LSN is not present in Log");
-    if (target_lsn <= durable_lsn_) return;
 
-    // Synchronize complete segments in authority order. Segment sync writes
-    // Store before Index, so durability may advance beyond the requested LSN.
+    // Group commit. Only one thread fsyncs at a time. Everyone else waits for
+    // it and then re-checks: a sync that started after their record was
+    // appended covers it, so under concurrency most callers never fsync.
+    while (true) {
+        if (target_lsn <= durable_lsn_) return;
+        if (!sync_in_progress_) break;
+        sync_done_.wait(lock);
+        if (segments_.empty()) throw std::runtime_error("Log was closed during synchronization");
+    }
+
+    // Take everything appended so far, not just target_lsn: the extra records
+    // cost nothing in the same fsync and spare their writers a sync of their own.
+    const Lsn sync_goal = next_lsn_ - 1;
+    std::vector<Segment*> to_sync;
     for (auto& segment : segments_) {
         if (segment->next_lsn() == segment->base_lsn()) continue;
-        const Lsn segment_last = segment->next_lsn() - 1;
-        if (segment_last <= durable_lsn_) continue;
-        segment->sync();
-        durable_lsn_ = segment_last;
-        if (durable_lsn_ >= target_lsn) break;
+        if (segment->next_lsn() - 1 <= durable_lsn_) continue;
+        to_sync.push_back(segment.get());
     }
+    sync_in_progress_ = true;
+    lock.unlock();
+
+    // Appends continue while the disk works. Segments are only destroyed by
+    // close(), which waits for sync_in_progress_ to clear, so these pointers
+    // stay valid. Authority order is preserved: older segments first, and
+    // Segment::sync writes Store before Index.
+    try {
+        for (Segment* segment : to_sync) segment->sync();
+    } catch (...) {
+        lock.lock();
+        sync_in_progress_ = false;
+        sync_done_.notify_all();
+        throw;
+    }
+
+    lock.lock();
+    durable_lsn_ = std::max(durable_lsn_, sync_goal);
+    sync_in_progress_ = false;
+    sync_done_.notify_all();
+}
+
+void Log::wait_for_sync_to_finish(std::unique_lock<std::shared_mutex>& lock) {
+    sync_done_.wait(lock, [this] { return !sync_in_progress_; });
 }
 Lsn Log::next_lsn() const noexcept { std::shared_lock lock(mutex_); return next_lsn_; }
 Lsn Log::durable_lsn() const noexcept { std::shared_lock lock(mutex_); return durable_lsn_; }
