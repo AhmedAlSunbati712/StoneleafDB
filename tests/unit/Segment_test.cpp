@@ -185,7 +185,10 @@ TEST(SegmentTest, RecoveryRemovesIndexEntriesBeyondStore) {
     EXPECT_EQ(recovered.read(0), offsets[0]);
 }
 
-TEST(SegmentTest, RecoveryRejectsCompleteIndexEntryWithWrongStoreOffset) {
+TEST(SegmentTest, RecoveryRebuildsIndexEntryWithWrongStoreOffset) {
+    // The Index is never synced on the commit path, so after a crash any of it
+    // may be stale. Store is synced and authoritative: recovery keeps only the
+    // Index entries that match it and rebuilds the rest.
     TempSegmentFiles files;
     const std::vector<WalRecord> records{
         WalRecord{.lsn = 60, .data = {'a'}},
@@ -194,9 +197,42 @@ TEST(SegmentTest, RecoveryRejectsCompleteIndexEntryWithWrongStoreOffset) {
     const std::vector<std::uint64_t> offsets = write_store_records(files, records);
     write_index_entries(files, {{0, offsets[0]}, {1, offsets[0]}});
 
-    EXPECT_THROW(
-        Segment(60, files.open_store(), files.open_index(), config()),
-        std::runtime_error);
+    {
+        Segment segment(60, files.open_store(), files.open_index(), config());
+        EXPECT_EQ(segment.next_lsn(), 62u);
+        EXPECT_EQ(segment.read(61).data, records[1].data);
+    }
+
+    Index recovered(files.open_index());
+    EXPECT_EQ(recovered.scan().entry_count, 2u);
+    EXPECT_EQ(recovered.read(1), offsets[1]);
+}
+
+TEST(SegmentTest, RecoveryRebuildsIndexWhoseUnsyncedTailReadsAsZeros) {
+    // A crash can persist the Index file's length but not its last blocks,
+    // which then read back as zeros: complete entries with ordinal 0.
+    TempSegmentFiles files;
+    const std::vector<WalRecord> records{
+        WalRecord{.lsn = 70, .data = {'a'}},
+        WalRecord{.lsn = 71, .data = {'b'}},
+        WalRecord{.lsn = 72, .data = {'c'}},
+    };
+    const std::vector<std::uint64_t> offsets = write_store_records(files, records);
+    write_index_entries(files, {{0, offsets[0]}});
+    const std::vector<char> zeros(2 * Index::ENTRY_SIZE, 0);
+    files.append_index_bytes(zeros);
+
+    {
+        Segment segment(70, files.open_store(), files.open_index(), config());
+        EXPECT_EQ(segment.next_lsn(), 73u);
+        EXPECT_EQ(segment.read(71).data, records[1].data);
+        EXPECT_EQ(segment.read(72).data, records[2].data);
+    }
+
+    Index recovered(files.open_index());
+    EXPECT_EQ(recovered.scan().status, IndexScanStatus::Complete);
+    EXPECT_EQ(recovered.scan().entry_count, 3u);
+    EXPECT_EQ(recovered.read(2), offsets[2]);
 }
 
 TEST(SegmentTest, RecoveryTruncatesIncompleteStoreTailAndExtraIndex) {

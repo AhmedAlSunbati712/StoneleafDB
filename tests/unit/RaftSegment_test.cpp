@@ -8,6 +8,8 @@
 
 #include <chrono>
 #include <filesystem>
+#include <span>
+#include <vector>
 #include <fcntl.h>
 
 namespace {
@@ -90,6 +92,34 @@ TEST(RaftSegmentTest, RecoveryRebuildsIndexFromAuthoritativeStore) {
     EXPECT_EQ(recovered.read(21).term, 5u);
     Index rebuilt(files.open_index());
     EXPECT_EQ(rebuilt.scan().entry_count, 2u);
+}
+
+TEST(RaftSegmentTest, RecoveryRebuildsIndexWhoseUnsyncedTailReadsAsZeros) {
+    TempSegmentFiles files;
+    std::uint64_t first_offset = 0;
+    {
+        Store store(files.open_store());
+        first_offset = store.append(RaftEntryCodec::encode(entry(2, 10)));
+        store.append(RaftEntryCodec::encode(entry(2, 11)));
+        store.append(RaftEntryCodec::encode(entry(3, 12)));
+    }
+    {
+        Index index(files.open_index());
+        index.append(0, first_offset);
+    }
+    {
+        // Two complete entries' worth of zeros: blocks the crash never wrote.
+        const int fd = files.open_index();
+        const std::vector<char> zeros(2 * Index::ENTRY_SIZE, 0);
+        disk::write_exact_at(fd, std::span<const char>(zeros),
+                             static_cast<std::streamoff>(Index::ENTRY_SIZE));
+        disk::close_file(fd);
+    }
+
+    RaftSegment recovered(10, files.open_store(), files.open_index(), config());
+    EXPECT_EQ(recovered.next_index(), 13u);
+    EXPECT_EQ(recovered.read(12).term, 3u);
+    EXPECT_EQ(recovered.term_at(11), 2u);
 }
 
 TEST(RaftSegmentTest, StoreFirstCrashShapeDoesNotResurrectSuffix) {
