@@ -10,6 +10,9 @@
 #include <Raft/RaftElection.h>
 #include <Raft/RaftLog.h>
 #include <Raft/RaftPeerClients.h>
+#include <Raft/RaftProposer.h>
+#include <Raft/RaftReadIndex.h>
+#include <Raft/RaftReplicator.h>
 #include <Raft/RaftServiceImpl.h>
 #include <Raft/RaftState.h>
 #include <Recovery.h>
@@ -50,22 +53,6 @@ enum class StartupStatus : std::uint8_t {
     FAILED,
 };
 
-// Returns {base_lsn, is_store}. Mirrors Log.cpp's own parse_segment_name:
-// a name starting with "segment-" must have the exact "<20 digits>.store" or
-// "<20 digits>.index" shape, or it's treated as corruption, not ignored.
-std::pair<std::uint64_t, bool> parse_segment_offset(const std::string& name) {
-    constexpr std::size_t prefix_size = 8;
-    constexpr std::size_t digits_size = 20;
-    if (!name.starts_with("segment-")) return {0, false};
-    const bool store = name.size() == prefix_size + digits_size + 6 && name.ends_with(".store");
-    const bool index = name.size() == prefix_size + digits_size + 6 && name.ends_with(".index");
-    if (!store && !index) throw std::runtime_error("Malformed WAL segment filename");
-    const auto digits = name.substr(prefix_size, digits_size);
-    if (digits.find_first_not_of("0123456789") != std::string::npos) throw std::runtime_error("Malformed WAL segment filename");
-    try { return {std::stoull(digits), store}; }
-    catch (...) { throw std::runtime_error("Malformed WAL segment filename"); }
-}
-
 Config setup_config(const std::string& database_directory) {
     // Log::open() requires initial_lsn to equal the smallest existing
     // segment's base LSN when segments already exist. A fresh database (no
@@ -77,7 +64,7 @@ Config setup_config(const std::string& database_directory) {
     if (std::filesystem::exists(wal_directory)) {
         for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
             const auto name = entry.path().filename().string();
-            const auto [base, is_store] = parse_segment_offset(name);
+            const auto [base, is_store] = parse_wal_segment_name(name);
             // Every segment has exactly one .store file, so counting only
             // those naturally avoids double-counting its paired .index file.
             if (!is_store) continue;
@@ -92,40 +79,6 @@ Config setup_config(const std::string& database_directory) {
     };
 }
 
-
-// Deletes every WAL segment that isn't the currently active one. Safe only
-// once redo has replayed the entire retained log onto the database file and
-// flush() has made every page undo dirtied durable there too - at that
-// point nothing outside the active segment is needed to recover again, even
-// if the active segment rolled over partway through the undo pass.
-void cleanup_finalized_segments(const std::string& db_file_name) {
-    const std::string wal_directory = db_file_name + ".wal";
-    if (!std::filesystem::exists(wal_directory)) return;
-
-    // The active segment is the one with the largest base LSN - segments are
-    // created with strictly increasing base LSNs, and Log always appends
-    // into the most recently created one.
-    std::optional<std::uint64_t> active_base;
-    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("segment-")) continue;
-        const auto [base, is_store] = parse_segment_offset(name);
-        if (!is_store) continue;
-        if (!active_base || base > *active_base) active_base = base;
-    }
-    // No segments at all means nothing to clean up.
-    if (!active_base) return;
-
-    // Delete both the .store and .index file for every non-active base LSN.
-    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("segment-")) continue;
-        const auto [base, is_store] = parse_segment_offset(name);
-        (void)is_store;
-        if (base == *active_base) continue;
-        std::filesystem::remove(entry.path());
-    }
-}
 
 // KeyStore, Log, and TransactionManager all have deleted copy/move
 // constructors, so they can't be built here and handed back by value - the
@@ -163,7 +116,7 @@ StartupStatus setup_database(
         // Undo needs the live KeyStore/BTree to actually navigate and mutate
         // the tree.
         aries_recovery_undo(log, key_store, unresolved_transactions);
-        cleanup_finalized_segments(db_file);
+        finish_recovery(transaction_manager, db_file, last_applied_raft_index);
     } catch (const std::exception &error) {
         std::cerr << "[ERROR] Recovery failed: " << error.what() << std::endl;
         return StartupStatus::FAILED;
@@ -317,7 +270,7 @@ int main(int argc, char *argv[]) {
     }
 
     // 4. The apply loop, on every server regardless of role.
-    RaftApplier applier(*raft_state, raft_log, key_store, transaction_manager, log);
+    RaftApplier applier(*raft_state, raft_log, key_store, transaction_manager);
     std::thread apply_thread([&applier] {
         try {
             applier.run();
@@ -362,9 +315,40 @@ int main(int argc, char *argv[]) {
     std::cout << "Serving Raft RPCs on 0.0.0.0:" << self_raft_address.port
               << " as " << self_raft_address.to_string() << std::endl;
 
-    // Step 6 of the startup order - the replication threads - does not exist
-    // yet, so a node that wins below leads without replicating and its peers
-    // will depose it on their next timeout. Expected until that lands.
+    // 6. The replication threads, one per peer, on every server. They park
+    //    immediately - we start as a follower - and the election thread wakes
+    //    them the moment this node wins. Created once and parked rather than
+    //    spawned on promotion: joining them in become_follower() would block a
+    //    step-down on an in-flight RPC to an unreachable peer.
+    std::vector<std::unique_ptr<RaftReplicator>> replicators;
+    std::vector<std::thread> replication_threads;
+    replicators.reserve(peers.size());
+    replication_threads.reserve(peers.size());
+    for (const NodeAddress &peer : peers) {
+        replicators.push_back(std::make_unique<RaftReplicator>(
+            *raft_state, raft_log, peer_clients, peer));
+        RaftReplicator &replicator = *replicators.back();
+        replication_threads.emplace_back([&replicator, peer] {
+            try {
+                replicator.run();
+            } catch (const std::exception &error) {
+                // An unreachable peer is absorbed inside the loop; reaching here
+                // means something structural failed. The node can still lead for
+                // its other peers and can still follow, so this is not fatal.
+                std::cerr << "[ERROR] Replication to " << peer.to_string()
+                          << " stopped: " << error.what() << std::endl;
+            }
+        });
+    }
+
+    // The session side of replication: turns a committed transaction's buffered
+    // writes into a Raft entry and waits for it to apply.
+    RaftProposer proposer(*raft_state, raft_log);
+
+    // Consistent reads: confirm leadership with a heartbeat round before
+    // answering from local state. A follower's reads are refused with
+    // NotLeader rather than served stale.
+    RaftReadIndex read_index(*raft_state);
 
     // 7. The election timer. LAST of the Raft threads on purpose: this is the
     //    first moment the node can campaign, so nothing a campaign depends on -
@@ -393,8 +377,12 @@ int main(int argc, char *argv[]) {
         }
         raft_state->apply_cv.notify_all();
         raft_state->election_cv.notify_all();
-        // Same order as the normal path: the outbound caller stops first, then
-        // our own server, and only then the log it was writing to.
+        raft_state->replication_cv.notify_all();
+        // Same order as the normal path: the outbound callers stop first, then
+        // our own server, and only then the log they were writing to.
+        for (std::thread &replication : replication_threads) {
+            if (replication.joinable()) replication.join();
+        }
         election_thread.join();
         raft_server->Shutdown();
         raft_server->Wait();
@@ -413,8 +401,12 @@ int main(int argc, char *argv[]) {
         }
         raft_state->apply_cv.notify_all();
         raft_state->election_cv.notify_all();
-        // Same order as the normal path: the outbound caller stops first, then
-        // our own server, and only then the log it was writing to.
+        raft_state->replication_cv.notify_all();
+        // Same order as the normal path: the outbound callers stop first, then
+        // our own server, and only then the log they were writing to.
+        for (std::thread &replication : replication_threads) {
+            if (replication.joinable()) replication.join();
+        }
         election_thread.join();
         raft_server->Shutdown();
         raft_server->Wait();
@@ -467,8 +459,8 @@ int main(int argc, char *argv[]) {
         try {
             std::lock_guard lock(sessions.mutex);
             sessions.open_sockets.insert(socket_fd);
-            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager] {
-                CommandServer::serve_connection(socket_fd, key_store, transaction_manager);
+            sessions.threads.emplace_back([&sessions, socket_fd, &key_store, &transaction_manager, &proposer, &read_index] {
+                CommandServer::serve_connection(socket_fd, key_store, transaction_manager, &proposer, &read_index);
                 std::lock_guard lock(sessions.mutex);
                 sessions.open_sockets.erase(socket_fd);
             });
@@ -495,6 +487,7 @@ int main(int argc, char *argv[]) {
     raft_state->replication_cv.notify_all();
     raft_state->apply_cv.notify_all();
     raft_state->applied_cv.notify_all();
+    raft_state->read_cv.notify_all();
 
     // 3. Sessions: wake any thread blocked reading its socket, then join. The
     //    acceptor has stopped, so no descriptor is being handed out any more.
@@ -506,23 +499,27 @@ int main(int argc, char *argv[]) {
         if (session.joinable()) session.join();
     }
 
-    // 4. Join the election thread. It goes BEFORE the RPC server stops because
-    //    it is the one still making outbound calls: shutting our own server
-    //    first would leave it campaigning at peers that can no longer answer.
-    //    A campaign in flight joins its own voters first, bounded by the RPC
-    //    deadline.
+    // 4. Join the replication threads. They are parked or between RPCs, so this
+    //    is bounded by the RPC deadline.
+    for (std::thread &replication : replication_threads) {
+        if (replication.joinable()) replication.join();
+    }
+
+    // 5. Join the election thread. Both outbound callers stop BEFORE the RPC
+    //    server does: shutting our own server first would leave them talking to
+    //    peers that can no longer answer.
     election_thread.join();
 
-    // 5. Stop serving Raft RPCs. Shutdown() returns only once every in-flight
+    // 6. Stop serving Raft RPCs. Shutdown() returns only once every in-flight
     //    handler has returned, which is what makes closing RaftLog below safe -
     //    the AppendEntries handler appends to it and truncates it.
     raft_server->Shutdown();
     raft_server->Wait();
 
-    // 6. The apply loop finishes its current batch before returning.
+    // 7. The apply loop finishes its current batch before returning.
     apply_thread.join();
 
-    // 7. Storage last, once nothing is running against it.
+    // 8. Storage last, once nothing is running against it.
     raft_log.close();
     if (key_store.close() != KeyStoreStatus::Success) {
         std::cerr << "[ERROR] Failed to close the database cleanly" << std::endl;

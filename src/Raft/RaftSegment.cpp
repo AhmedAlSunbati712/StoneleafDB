@@ -117,12 +117,25 @@ void RaftSegment::truncate_suffix(std::uint64_t from_index) {
 }
 
 void RaftSegment::sync() {
-    std::unique_lock lock(mutex_);
-    if (recovery_required_) {
-        throw std::runtime_error("Raft segment must be recovered before synchronization");
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Raft segment must be recovered before synchronization");
+        }
     }
+    // As Segment::sync: the fsyncs run with the lock released.
     store_.sync();
     index_.sync();
+}
+
+void RaftSegment::sync_store() {
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Raft segment must be recovered before synchronization");
+        }
+    }
+    store_.sync();
 }
 
 bool RaftSegment::is_maxed() const {
@@ -155,31 +168,14 @@ void RaftSegment::recover() {
         store_scan = store_.scan();
     }
 
-    const IndexScanResult index_scan = index_.scan();
-    if (index_scan.status == IndexScanStatus::Corrupt) {
-        throw std::runtime_error("Raft Index contains a corrupt complete entry");
-    }
-
-    std::uint64_t common_count = std::min(index_scan.entry_count, store_scan.record_count);
-    std::uint64_t store_suffix_offset = 0;
-    if (common_count > 0) {
-        const std::uint64_t ordinal = common_count - 1;
-        const std::uint64_t indexed_offset =
-            index_.read(static_cast<std::uint32_t>(ordinal));
-        const std::vector<char> encoded = store_.read(indexed_offset);
-        const RaftMutationEntry entry = RaftEntryCodec::decode(encoded);
-        const std::uint64_t next_offset =
-            indexed_offset + Store::RECORD_LENGTH_SIZE + encoded.size();
-        if (entry.idx != base_index_ + ordinal || next_offset > store_scan.valid_size) {
-            throw std::runtime_error("Raft Index does not identify the expected Store entry");
-        }
-        store_suffix_offset = next_offset;
-    }
-
-    std::vector<std::uint64_t> missing_offsets;
-    std::uint64_t ordinal = common_count;
-    std::uint64_t cursor = store_suffix_offset;
+    // As Segment::recover: Store is synced and authoritative, the Index is not
+    // synced on the append path, so walk Store for the real frame offsets and
+    // trust only the Index prefix that agrees with them.
+    std::vector<std::uint64_t> store_offsets;
+    store_offsets.reserve(static_cast<std::size_t>(store_scan.record_count));
+    std::uint64_t cursor = 0;
     while (cursor < store_scan.valid_size) {
+        const std::uint64_t ordinal = store_offsets.size();
         const std::vector<char> encoded = store_.read(cursor);
         const RaftMutationEntry entry = RaftEntryCodec::decode(encoded);
         if (entry.idx != base_index_ + ordinal) {
@@ -188,12 +184,20 @@ void RaftSegment::recover() {
         if (ordinal > std::numeric_limits<std::uint32_t>::max()) {
             throw std::length_error("Raft segment exceeds the Index representation");
         }
-        missing_offsets.push_back(cursor);
+        store_offsets.push_back(cursor);
         cursor += Store::RECORD_LENGTH_SIZE + encoded.size();
-        ordinal += 1;
     }
-    if (ordinal != store_scan.record_count) {
+    if (store_offsets.size() != store_scan.record_count) {
         throw std::runtime_error("Raft Store framing count disagrees with decoded entries");
+    }
+
+    const IndexScanResult index_scan = index_.scan();
+    const std::uint64_t candidate_count =
+        std::min<std::uint64_t>(index_scan.entry_count, store_offsets.size());
+    std::uint64_t common_count = 0;
+    while (common_count < candidate_count &&
+           index_.read(static_cast<std::uint32_t>(common_count)) == store_offsets[common_count]) {
+        common_count += 1;
     }
 
     bool index_changed = false;
@@ -202,9 +206,8 @@ void RaftSegment::recover() {
         index_.truncate_to(common_count);
         index_changed = true;
     }
-    for (std::uint64_t offset : missing_offsets) {
-        index_.append(static_cast<std::uint32_t>(common_count), offset);
-        common_count += 1;
+    for (std::uint64_t ordinal = common_count; ordinal < store_offsets.size(); ++ordinal) {
+        index_.append(static_cast<std::uint32_t>(ordinal), store_offsets[ordinal]);
         index_changed = true;
     }
 

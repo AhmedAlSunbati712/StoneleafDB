@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -24,6 +25,21 @@ namespace {
 
 Config recovery_wal_config() {
     return {.max_index_bytes = 1000 * Index::ENTRY_SIZE, .max_store_bytes = 16 * 1024 * 1024, .initial_lsn = 1};
+}
+
+// As server.cpp's setup_config: once cleanup has run, the log no longer
+// starts at LSN 1, so reopen it at its smallest surviving segment.
+Config reopened_wal_config(const std::string& db_file) {
+    Config config = recovery_wal_config();
+    const std::string wal_directory = db_file + ".wal";
+    if (!std::filesystem::exists(wal_directory)) return config;
+    std::optional<std::uint64_t> smallest_base;
+    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
+        const auto [base, is_store] = parse_wal_segment_name(entry.path().filename().string());
+        if (is_store && (!smallest_base || base < *smallest_base)) smallest_base = base;
+    }
+    config.initial_lsn = smallest_base.value_or(1);
+    return config;
 }
 
 MutationOp put_op(std::uint64_t id, const std::string& text) {
@@ -84,8 +100,10 @@ protected:
             state.set_commit_index(raft_log.last_index());
         }
 
-        RaftApplier applier(state, raft_log, store, transaction_manager, wal);
-        EXPECT_EQ(applier.apply_pending_batch(), entries.size());
+        RaftApplier applier(state, raft_log, store, transaction_manager);
+        std::size_t applied = 0;
+        while (std::size_t batch = applier.apply_pending_batch()) applied += batch;
+        EXPECT_EQ(applied, entries.size());
 
         if (leave_one_uncommitted) {
             // A transaction that wrote but never committed: ARIES rolls it back,
@@ -108,12 +126,31 @@ protected:
 
     // Runs analysis + redo over the WAL left on disk and returns the watermark.
     std::uint64_t recovered_watermark() {
-        Log wal(recovery_wal_config());
+        Log wal(reopened_wal_config(db_file));
         wal.open(db_file + ".wal");
         std::unordered_map<TransactionId, Lsn> unresolved;
         std::uint64_t last_applied = 0;
         aries_recovery_redo(wal, db_file, unresolved, last_applied);
         return last_applied;
+    }
+
+    // One startup as server.cpp performs it: redo, undo through the live
+    // KeyStore, then persist the watermark and delete finalized segments.
+    void restart_like_server() {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(reopened_wal_config(db_file));
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        wal.open(db_file + ".wal");
+
+        std::unordered_map<TransactionId, Lsn> unresolved;
+        std::uint64_t last_applied = 0;
+        aries_recovery_redo(wal, db_file, unresolved, last_applied);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        aries_recovery_undo(wal, store, unresolved);
+        finish_recovery(transaction_manager, db_file, last_applied);
+        ASSERT_EQ(store.close(), KeyStoreStatus::Success);
     }
 
     std::filesystem::path temp_dir;
@@ -159,6 +196,160 @@ TEST_F(RecoveryWatermarkTest, ClientTransactionsDoNotMoveTheWatermark) {
     }
 
     EXPECT_EQ(recovered_watermark(), 1u);
+}
+
+TEST_F(RecoveryWatermarkTest, SurvivesCleanupOfEverySegmentThatCarriedIt) {
+    // Client transactions write WAL records but carry no Raft index. Enough of
+    // them after the applied entries leave the newest segment - the only one
+    // cleanup keeps - with no commit record that knows the watermark.
+    apply_entries({{put_op(1, "a")}, {put_op(2, "b")}, {put_op(3, "c")}});
+    {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(reopened_wal_config(db_file));
+        wal.open(db_file + ".wal");
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        for (int i = 0; i < 1500; ++i) {
+            TransactionHandle client = transaction_manager.begin();
+            ASSERT_EQ(transaction_manager.commit(client, Durability::Defer), CommitStatus::Success);
+        }
+        ASSERT_EQ(store.close(), KeyStoreStatus::Success);
+    }
+
+    restart_like_server();
+    EXPECT_EQ(recovered_watermark(), 3u);
+    restart_like_server();
+    EXPECT_EQ(recovered_watermark(), 3u);
+}
+
+TEST_F(RecoveryWatermarkTest, PagesRestoredOnlyByRedoAreReadable) {
+    // The node goes down with an open transaction, so no page was flushed at
+    // close: every tree page on disk after recovery was written by redo.
+    constexpr std::uint64_t entry_count = 300;
+    std::vector<std::vector<MutationOp>> entries;
+    for (std::uint64_t id = 0; id < entry_count; ++id) {
+        entries.push_back({put_op(id, "a")});
+    }
+    apply_entries(entries, /*leave_one_uncommitted=*/true);
+
+    KeyStore store;
+    LockManager lock_manager;
+    Log wal(reopened_wal_config(db_file));
+    TransactionManager transaction_manager(wal, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    wal.open(db_file + ".wal");
+    std::unordered_map<TransactionId, Lsn> unresolved;
+    std::uint64_t last_applied = 0;
+    aries_recovery_redo(wal, db_file, unresolved, last_applied);
+    ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+    aries_recovery_undo(wal, store, unresolved);
+
+    for (std::uint64_t id = 0; id < entry_count; ++id) {
+        TransactionHandle reader = transaction_manager.begin();
+        const KeyStoreGetResult result =
+            store.get(reader, KeyCodec::encode(KeyInput{id}).value());
+        ASSERT_EQ(result.status, KeyStoreStatus::Success) << "key " << id;
+        ASSERT_EQ(transaction_manager.commit(reader), CommitStatus::Success);
+    }
+    ASSERT_EQ(store.close(), KeyStoreStatus::Success);
+}
+
+TEST_F(RecoveryWatermarkTest, AnUnsyncedApplyTailLostInACrashIsReappliedFromTheRaftLog) {
+    // Crash image: the WAL as of a sync after entry 5. Entries 6-10 were then
+    // applied - and acknowledged - without a WAL sync, and that tail is lost.
+    // The Raft log still holds all ten, as it would on a majority.
+    const std::filesystem::path image = temp_dir / "crash-image";
+    {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(recovery_wal_config());
+        wal.open(db_file + ".wal");
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        RaftLog raft_log(recovery_wal_config());
+        raft_log.open(db_file + ".raft");
+        RaftHardStateStore hard_state;
+        hard_state.open((temp_dir / "hardstate").string());
+        RaftState state(
+            std::vector<ClusterMember>{
+                {.raft = SELF_RAFT, .database_server = SELF_CLIENT},
+                {.raft = PEER_RAFT, .database_server = PEER_CLIENT},
+            },
+            SELF_CLIENT, hard_state, 0);
+        RaftApplier applier(state, raft_log, store, transaction_manager);
+
+        for (std::uint64_t id = 1; id <= 10; ++id) raft_log.append(1, {put_op(id, "a")});
+        raft_log.sync_through(10);
+
+        {
+            std::lock_guard lock(state.state_mutex);
+            state.set_commit_index(5);
+        }
+        while (applier.apply_pending_batch() > 0) {}
+        wal.sync_through(wal.next_lsn() - 1);
+        // No page reaches the database file before its WAL is durable, so the
+        // file plus the synced WAL is exactly what a crash here leaves.
+        std::filesystem::create_directories(image);
+        std::filesystem::copy_file(db_file, image / "test.db");
+        std::filesystem::copy(db_file + ".wal", image / "test.db.wal",
+                              std::filesystem::copy_options::recursive);
+
+        {
+            std::lock_guard lock(state.state_mutex);
+            state.set_commit_index(10);
+        }
+        while (applier.apply_pending_batch() > 0) {}
+        // Abandoned without close: the unsynced tail never reaches the image.
+    }
+
+    std::filesystem::remove(db_file);
+    std::filesystem::remove_all(db_file + ".wal");
+    std::filesystem::copy_file(image / "test.db", db_file);
+    std::filesystem::copy(image / "test.db.wal", db_file + ".wal",
+                          std::filesystem::copy_options::recursive);
+
+    KeyStore store;
+    LockManager lock_manager;
+    Log wal(reopened_wal_config(db_file));
+    TransactionManager transaction_manager(wal, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    wal.open(db_file + ".wal");
+    std::unordered_map<TransactionId, Lsn> unresolved;
+    std::uint64_t last_applied = 0;
+    aries_recovery_redo(wal, db_file, unresolved, last_applied);
+    ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+    aries_recovery_undo(wal, store, unresolved);
+    finish_recovery(transaction_manager, db_file, last_applied);
+    EXPECT_EQ(last_applied, 5u);
+
+    RaftLog raft_log(recovery_wal_config());
+    raft_log.open(db_file + ".raft");
+    RaftHardStateStore hard_state;
+    hard_state.open((temp_dir / "hardstate").string());
+    RaftState state(
+        std::vector<ClusterMember>{
+            {.raft = SELF_RAFT, .database_server = SELF_CLIENT},
+            {.raft = PEER_RAFT, .database_server = PEER_CLIENT},
+        },
+        SELF_CLIENT, hard_state, last_applied);
+    {
+        std::lock_guard lock(state.state_mutex);
+        state.set_commit_index(10);
+    }
+    RaftApplier applier(state, raft_log, store, transaction_manager);
+    while (applier.apply_pending_batch() > 0) {}
+
+    for (std::uint64_t id = 1; id <= 10; ++id) {
+        TransactionHandle reader = transaction_manager.begin();
+        const KeyStoreGetResult result =
+            store.get(reader, KeyCodec::encode(KeyInput{id}).value());
+        EXPECT_EQ(result.status, KeyStoreStatus::Success) << "key " << id;
+        ASSERT_EQ(transaction_manager.commit(reader), CommitStatus::Success);
+    }
+    ASSERT_EQ(store.close(), KeyStoreStatus::Success);
 }
 
 } // namespace

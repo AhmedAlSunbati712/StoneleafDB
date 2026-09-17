@@ -127,15 +127,29 @@ std::vector<WalRecord> Segment::scan() const {
 }
 
 void Segment::sync() {
-    std::unique_lock lock(mutex_);
-    if (recovery_required_) {
-        throw std::runtime_error("Segment must be recovered before synchronization");
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Segment must be recovered before synchronization");
+        }
     }
+    // Not held across the fsyncs below: a concurrent append only adds bytes
+    // beyond what the caller asked to make durable.
 
     // Preserve the same authority ordering used by append: once the derived
     // Index is durable, every entry it contains must have durable Store bytes.
     store_.sync();
     index_.sync();
+}
+
+void Segment::sync_store() {
+    {
+        std::shared_lock lock(mutex_);
+        if (recovery_required_) {
+            throw std::runtime_error("Segment must be recovered before synchronization");
+        }
+    }
+    store_.sync();
 }
 
 bool Segment::is_maxed() const {
@@ -174,50 +188,16 @@ void Segment::recover() {
         store_scan = store_.scan();
     }
 
-    // Phase 2: identify the complete prefix present in both files. The crash
-    // model trusts every structurally complete Index entry; corruption inside
-    // a complete entry is outside recovery scope and must fail open.
-    const IndexScanResult index_scan = index_.scan();
-    if (index_scan.status == IndexScanStatus::Corrupt) {
-        throw std::runtime_error("Index contains a corrupt complete entry");
-    }
-
-    // Starting at the smaller record count excludes an Index entry whose Store
-    // frame did not survive, or Store records whose Index entries did not
-    // survive. Both are expected append-ordering outcomes after a crash.
-    std::uint64_t common_entry_count =
-        std::min(index_scan.entry_count, store_scan.record_count);
-    std::uint64_t store_suffix_offset = 0;
-
-    // The final retained Index entry tells us where the missing Store suffix
-    // begins. If there is no retained prefix, recovery starts at Store offset
-    // zero and recreates every missing mapping.
-    if (common_entry_count > 0) {
-        const std::uint64_t relative_lsn = common_entry_count - 1;
-        const std::uint64_t indexed_store_offset =
-            index_.read(static_cast<std::uint32_t>(relative_lsn));
-        const std::vector<char> encoded = store_.read(indexed_store_offset);
-        const WalRecord record = WalRecordCodec::decode(encoded);
-        const std::uint64_t next_store_offset =
-            indexed_store_offset + Store::RECORD_LENGTH_SIZE + encoded.size();
-
-        // This is a consistency assertion, not a repair path. A complete entry
-        // with damaged offset bytes is outside the supported crash model.
-        if (record.lsn != base_lsn_ + relative_lsn ||
-            next_store_offset > store_scan.valid_size) {
-            throw std::runtime_error("Index entry does not identify the expected Store record");
-        }
-
-        store_suffix_offset = next_store_offset;
-    }
-
-    // Phase 3: validate the authoritative suffix and remember each frame
-    // offset. Finish all Store validation before truncating or rewriting Index,
-    // so an invalid Store never destroys a still-useful derived prefix.
-    std::vector<std::uint64_t> missing_store_offsets;
-    std::uint64_t relative_lsn = common_entry_count;
-    std::uint64_t cursor = store_suffix_offset;
+    // Phase 2: walk the authoritative Store and record where every frame
+    // starts, validating the dense absolute-LSN sequence as we go. Store is
+    // synced before any record it holds is acknowledged; the Index is not
+    // synced on that path at all, so nothing in it is trusted until checked
+    // against these offsets.
+    std::vector<std::uint64_t> store_offsets;
+    store_offsets.reserve(static_cast<std::size_t>(store_scan.record_count));
+    std::uint64_t cursor = 0;
     while (cursor < store_scan.valid_size) {
+        const std::uint64_t relative_lsn = store_offsets.size();
         const std::vector<char> encoded = store_.read(cursor);
         const WalRecord record = WalRecordCodec::decode(encoded);
         if (record.lsn != base_lsn_ + relative_lsn) {
@@ -226,35 +206,42 @@ void Segment::recover() {
         if (relative_lsn > std::numeric_limits<std::uint32_t>::max()) {
             throw std::length_error("Segment contains more records than its Index can represent");
         }
-
-        missing_store_offsets.push_back(cursor);
+        store_offsets.push_back(cursor);
         cursor += Store::RECORD_LENGTH_SIZE + encoded.size();
-        relative_lsn += 1;
     }
 
     // The number of decoded dense records must agree with the framing scan.
     // A disagreement means a structurally complete retained entry was invalid,
     // which is corruption rather than an incomplete crash tail.
-    if (relative_lsn != store_scan.record_count) {
+    if (store_offsets.size() != store_scan.record_count) {
         throw std::runtime_error("Store framing count disagrees with recovered WAL records");
     }
 
-    // Phase 4: discard only bytes explained by a crash: a partial final Index
-    // entry or complete entries beyond the repaired Store record count.
-    const bool index_needs_truncation =
-        index_scan.status != IndexScanStatus::Complete ||
-        index_scan.entry_count != common_entry_count;
+    // Phase 3: keep the longest Index prefix that agrees with Store. The scan
+    // already stops at the first entry whose ordinal is wrong - which is how
+    // blocks a crash never wrote, reading back as zeros, show up - and each
+    // retained entry must also point at the right frame. Everything after the
+    // first disagreement is derived data and is rebuilt below.
+    const IndexScanResult index_scan = index_.scan();
+    const std::uint64_t candidate_count =
+        std::min<std::uint64_t>(index_scan.entry_count, store_offsets.size());
+    std::uint64_t common_entry_count = 0;
+    while (common_entry_count < candidate_count &&
+           index_.read(static_cast<std::uint32_t>(common_entry_count)) ==
+               store_offsets[common_entry_count]) {
+        common_entry_count += 1;
+    }
+
+    // Phase 4: drop the disagreeing or unmatched Index suffix, then recreate
+    // every mapping after the common prefix from Store.
     bool index_changed = false;
-    if (index_needs_truncation) {
+    if (index_scan.status != IndexScanStatus::Complete ||
+        index_scan.entry_count != common_entry_count) {
         index_.truncate_to(common_entry_count);
         index_changed = true;
     }
-
-    // Recreate only mappings missing after the common prefix. An empty or fully
-    // incomplete Index naturally rebuilds from Store offset zero.
-    for (std::uint64_t offset : missing_store_offsets) {
-        index_.append(static_cast<std::uint32_t>(common_entry_count), offset);
-        common_entry_count += 1;
+    for (std::uint64_t ordinal = common_entry_count; ordinal < store_offsets.size(); ++ordinal) {
+        index_.append(static_cast<std::uint32_t>(ordinal), store_offsets[ordinal]);
         index_changed = true;
     }
 

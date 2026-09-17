@@ -86,6 +86,11 @@ public:
     // out from under a transaction that may still reference it.
     bool has_active_transactions() const noexcept;
 
+    // Writes the transaction's deferred TXN_BEGIN if it has none yet, and
+    // returns the LSN its next action must chain to. begin() logs nothing, so
+    // a caller about to build a PendingBTreeAction calls this first.
+    Lsn prepare_to_log(const TransactionHandle& transaction);
+
     // Appends one completed B-tree action and advances the transaction's WAL
     // chain only after Log assigns the record an LSN.
     Lsn append_action(const TransactionHandle& transaction, PendingWalRecord action);

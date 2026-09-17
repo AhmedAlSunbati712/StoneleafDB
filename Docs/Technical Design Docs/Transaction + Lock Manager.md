@@ -267,7 +267,11 @@ undo executor required to finish either boundary.
 1. The atomic transition from `Active` to `Committing`.
 2. Verification that the transaction has no unfinished B+ tree action.
 3. Append of `TXN_COMMIT` through the transaction's `prevLSN` chain.
-4. WAL synchronization through the commit record.
+4. WAL synchronization through the commit record — skipped when the
+   transaction logged no B+ tree action and the record carries no Raft index.
+   Such a transaction changed nothing: if its commit record is lost in a crash,
+   recovery ends it with nothing to undo, and the client could not tell. This
+   keeps read-only transactions off the disk.
 5. The transition to `Committed`.
 6. Logical-lock and graph cleanup.
 7. Removal from the active table.
@@ -296,6 +300,16 @@ commit durability, logical abort traversal, CLR chaining, durable `TXN_END`,
 and terminal cleanup. `append_action()` accepts only a matching B-tree action
 whose transaction ID and `prevLSN` agree with the current transaction, then
 updates `last_lsn_` only after the append succeeds.
+
+Begin records are deferred. `begin()` registers the transaction but appends
+nothing; `prepare_to_log()` appends `TXN_BEGIN` the first time a caller is about
+to build an action, and returns the LSN that action must chain to. Commit
+writes a decision only for a transaction that logged something or carries a
+Raft index, and abort of a transaction that logged nothing writes nothing. Most
+transactions - reads, and every replicated session's lock-only transaction -
+therefore never touch the WAL. That matters beyond record count: on macOS a
+`write()` stalls while any `F_FULLFSYNC` on the volume is in flight, so every
+append a session skips is one fewer stall for the apply loop.
 
 The first `begin()` after opening a retained WAL scans its records and chooses
 one greater than the largest prior transaction ID. This prevents transaction
@@ -782,7 +796,8 @@ not need to recreate an earlier tree shape.
 
 Only after every inverse has a CLR and `TXN_END` is durable may
 `TransactionManager` release the transaction's logical locks and acknowledge
-abort. Page latches remain operation-scoped and are never retained through
+abort. A transaction that logged no action has no inverse, so its `TXN_END` is
+appended but not synchronized, for the same reason its commit is not. Page latches remain operation-scoped and are never retained through
 client think-time.
 
 ## Autocommit Statements

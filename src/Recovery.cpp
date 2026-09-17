@@ -3,6 +3,7 @@
 #include <DiskIO.h>
 #include <Log/WalPayloadCodec.h>
 #include <Log/WalRecords.h>
+#include <V2PageCodec.h>
 
 #include <fcntl.h>
 
@@ -19,10 +20,10 @@
 #include <utility>
 #include <vector>
 
-void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effects) {
+void redo_page_effects(int db_fd, Lsn record_lsn, std::vector<PageEffect>& page_effects) {
     // db_fd is opened once by the caller for the whole redo pass and synced
     // once at the end, rather than per record.
-    for (const PageEffect &effect : page_effects) {
+    for (PageEffect &effect : page_effects) {
         switch (effect.kind) {
             case PageEffectKind::Write:
             case PageEffectKind::Allocate:
@@ -32,6 +33,13 @@ void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effect
                 // write regardless of which structural event produced it.
                 // PageEffect already carries page_num directly, so no PageV2
                 // decode is needed just to find where this page lives.
+                //
+                // The image is captured before the record has an LSN, so it
+                // still carries the previous pageLSN and a stale checksum.
+                // Stamp both exactly as Pager does when it publishes the page;
+                // written verbatim, the page fails validation on every read.
+                V2PageCodec::set_page_lsn(effect.after_image, record_lsn);
+                V2PageCodec::update_checksum(effect.after_image);
                 disk::write_exact_at(
                     db_fd,
                     std::span<const char>(effect.after_image),
@@ -74,21 +82,21 @@ void aries_recovery_redo(
                 }
                 case WalRecordType::BTreeAction: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<BTreeActionPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<BTreeActionPayload>(payload).effects);
                     current_offset += 1;
                     unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
                     continue;
                 }
                 case WalRecordType::Compensation: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<CompensationPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<CompensationPayload>(payload).effects);
                     current_offset += 1;
                     unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
                     continue;
                 }
                 case WalRecordType::SystemAction: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<SystemActionPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<SystemActionPayload>(payload).effects);
                     current_offset += 1;
                     continue;
                 }
@@ -276,4 +284,72 @@ void aries_recovery_undo(
         // turn it into a reported StartupStatus::FAILED.
         throw std::runtime_error("Failed to flush recovery-dirtied pages to the database file");
     }
+}
+
+// Returns {base_lsn, is_store}. Mirrors Log.cpp's own parse_segment_name:
+// a name starting with "segment-" must have the exact "<20 digits>.store" or
+// "<20 digits>.index" shape, or it's treated as corruption, not ignored.
+std::pair<std::uint64_t, bool> parse_wal_segment_name(const std::string& name) {
+    constexpr std::size_t prefix_size = 8;
+    constexpr std::size_t digits_size = 20;
+    if (!name.starts_with("segment-")) return {0, false};
+    const bool store = name.size() == prefix_size + digits_size + 6 && name.ends_with(".store");
+    const bool index = name.size() == prefix_size + digits_size + 6 && name.ends_with(".index");
+    if (!store && !index) throw std::runtime_error("Malformed WAL segment filename");
+    const auto digits = name.substr(prefix_size, digits_size);
+    if (digits.find_first_not_of("0123456789") != std::string::npos) throw std::runtime_error("Malformed WAL segment filename");
+    try { return {std::stoull(digits), store}; }
+    catch (...) { throw std::runtime_error("Malformed WAL segment filename"); }
+}
+
+// Deletes every WAL segment that isn't the currently active one. Safe only
+// once redo has replayed the entire retained log onto the database file and
+// flush() has made every page undo dirtied durable there too - at that
+// point nothing outside the active segment is needed to recover again, even
+// if the active segment rolled over partway through the undo pass.
+void cleanup_finalized_segments(const std::string& db_file_name) {
+    const std::string wal_directory = db_file_name + ".wal";
+    if (!std::filesystem::exists(wal_directory)) return;
+
+    // The active segment is the one with the largest base LSN - segments are
+    // created with strictly increasing base LSNs, and Log always appends
+    // into the most recently created one.
+    std::optional<std::uint64_t> active_base;
+    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("segment-")) continue;
+        const auto [base, is_store] = parse_wal_segment_name(name);
+        if (!is_store) continue;
+        if (!active_base || base > *active_base) active_base = base;
+    }
+    // No segments at all means nothing to clean up.
+    if (!active_base) return;
+
+    // Delete both the .store and .index file for every non-active base LSN.
+    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("segment-")) continue;
+        const auto [base, is_store] = parse_wal_segment_name(name);
+        (void)is_store;
+        if (base == *active_base) continue;
+        std::filesystem::remove(entry.path());
+    }
+}
+
+void finish_recovery(
+    TransactionManager& transaction_manager,
+    const std::string& db_file_name,
+    std::uint64_t last_applied_raft_index
+) {
+    if (last_applied_raft_index > 0) {
+        // An empty transaction whose commit record carries the watermark.
+        // Commit syncs it, and appends only ever land in the active segment,
+        // which cleanup keeps.
+        TransactionHandle carrier = transaction_manager.begin();
+        if (transaction_manager.commit(carrier, Durability::Sync, last_applied_raft_index)
+                != CommitStatus::Success) {
+            throw std::runtime_error("Failed to persist the Raft watermark before WAL cleanup");
+        }
+    }
+    cleanup_finalized_segments(db_file_name);
 }

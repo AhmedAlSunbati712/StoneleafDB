@@ -182,8 +182,17 @@ void Store::truncate_to(std::uint64_t record_count) {
 }
 
 void Store::sync() {
-    std::unique_lock lock(mutex_);
-    disk::sync_file_to_disk_fd(fd_);
+    // The fsync runs with the lock released so appends are not stalled behind
+    // the disk. It still covers every byte whose append returned before this
+    // call: those write()s completed, and fsync flushes all completed writes.
+    // The descriptor outlives the call because only the owner that is waiting
+    // for this sync to finish can close it.
+    int fd = -1;
+    {
+        std::shared_lock lock(mutex_);
+        fd = fd_;
+    }
+    disk::sync_file_to_disk_fd(fd);
 }
 
 std::uint64_t Store::size() const {

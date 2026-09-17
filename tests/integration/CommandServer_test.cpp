@@ -42,7 +42,12 @@ class Connection {
                 CommandServer::serve_connection,
                 sockets[1],
                 std::ref(key_store),
-                std::ref(transaction_manager));
+                std::ref(transaction_manager),
+                // No proposer and no read index: this fixture has no cluster,
+                // so writes go straight through KeyStore and reads are served
+                // from local state, exactly as they always have.
+                nullptr,
+                nullptr);
         }
 
         ~Connection() {
@@ -83,7 +88,12 @@ class RawConnection {
                 CommandServer::serve_connection,
                 sockets[1],
                 std::ref(key_store),
-                std::ref(transaction_manager));
+                std::ref(transaction_manager),
+                // No proposer and no read index: this fixture has no cluster,
+                // so writes go straight through KeyStore and reads are served
+                // from local state, exactly as they always have.
+                nullptr,
+                nullptr);
         }
 
         ~RawConnection() {

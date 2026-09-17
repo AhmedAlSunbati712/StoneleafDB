@@ -355,7 +355,7 @@ KeyStoreStatus KeyStore::put(
         return KeyStoreStatus::ReadFailed;
     }
 
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), transaction_manager->prepare_to_log(transaction));
     if (previous.status == BTreeStatus::Success) {
         action.set_undo(UpdateUndo{key, previous.value});
     } else {
@@ -421,7 +421,7 @@ KeyStoreRemoveResult KeyStore::remove(
         return result;
     }
 
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), transaction_manager->prepare_to_log(transaction));
     action.set_undo(DeleteUndo{key, previous.value});
     BTreeRemoveStatus remove_result = tree.remove(transaction, key, action);
     if (remove_result.status != BTreeStatus::Success) {

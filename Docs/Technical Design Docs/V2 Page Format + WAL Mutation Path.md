@@ -401,21 +401,25 @@ written to them. Recovery handles missing writes, incomplete append tails, and
 Store/Index persistence gaps; arbitrary damage inside complete bytes is outside
 scope and fails open rather than being repaired.
 
-Segment open repairs only crash-explained suffix differences:
+Only the Store is synced at a durability boundary. `Log::sync_through` and
+`RaftLog::sync_through` call `sync_store()`; the Index is synced only by
+`close()` and by recovery. So after a crash the Index can be arbitrarily stale:
+short, with blocks that were never written reading back as zeros, or with
+entries pointing at the wrong frame. Segment open therefore trusts none of it
+until it agrees with the Store:
 
 1. Truncate an incomplete Store frame to the last complete boundary.
-2. Reject a structurally complete Index entry whose relative LSN is corrupt.
-3. Retain the smaller of the complete Store and Index counts.
-4. Use the last retained Index entry to locate the Store suffix, or Store offset
-   zero when no Index entries survived.
-5. Truncate a partial or extra Index suffix and append mappings only for Store
-   records missing from the Index.
+2. Walk the whole Store, recording each frame's offset and checking the dense
+   absolute-LSN (or Raft index) sequence.
+3. Retain the longest Index prefix whose entries have the right ordinal and
+   point at the right frame. A zero-filled block fails the ordinal check.
+4. Truncate everything after that prefix and append mappings for every
+   remaining Store record.
 
 Recovery synchronizes a changed authoritative Store before the repaired Index.
-Normal `sync()` uses the same Store-before-Index order. This tail-oriented rule
-avoids rescanning and rewriting the whole Index after an incomplete Index
-append. It does not walk backward through complete entries looking for a
-repairable boundary.
+Walking the whole Store costs a read of every record in the segment on open,
+which recovery's redo pass reads anyway; in exchange no Index state a crash can
+produce stops the log from opening.
 
 The minimal record codec catches short records, reserved LSN zero, and a
 non-dense absolute-LSN sequence. It does not yet protect opaque data with a
@@ -483,6 +487,16 @@ crossing record leaves the current segment maxed. `sync_through` synchronizes
 the required segments in LSN order, always Store before its derived Index, and
 advances `durable_lsn_` through at least the requested record.
 
+`sync_through` is a group commit. One thread syncs at a time, with the `Log`
+mutex released, and it takes everything appended when it started rather than
+only its own target; a caller arriving meanwhile waits and usually finds its
+record already covered. `Store::sync` and `Index::sync` fsync without holding
+their locks either, since a sync only has to cover appends that returned before
+it began. `close()` waits for an in-flight sync, which holds raw segment
+pointers. On macOS each fsync is an `F_FULLFSYNC`, which also stalls `write()`
+calls to other files on the same volume while it runs, so the fewer threads that
+append to the WAL at all, the better appends behave under load.
+
 `Log`, `Segment`, `Store`, and `Index` remain unaware of `Key`, `Value`, page
 layout, splits, or logical undo. The common WAL envelope gains record type,
 transaction ID, `prevLSN`, framing validation, and checksum, but its payload
@@ -542,7 +556,12 @@ advanced after each successful append.
 
 ### Transaction Boundary Records
 
-`TXN_BEGIN` starts the chain and has `prevLSN = 0`. `TXN_COMMIT` records the
+`TXN_BEGIN` starts the chain and has `prevLSN = 0`. It is written lazily:
+`TransactionManager::begin()` logs nothing, and `prepare_to_log()` writes the
+begin just before the transaction's first action is built. A transaction that
+never logs an action - a read, or a replicated session's lock-only local
+transaction - writes no WAL records at all, not even a decision; one whose
+commit carries a Raft index always writes its begin and commit. `TXN_COMMIT` records the
 commit decision and becomes the transaction's durability point when WAL is
 synchronized through its end. `TXN_ABORT` records the reason rollback began;
 it does not mean rollback finished. `TXN_END` records completed cleanup,
@@ -970,7 +989,9 @@ checkpoint metadata, and safe segment reclamation are a later milestone.
 - `finish_mutation` appends but does not synchronize the WAL.
 - A cached after-image is never written to the database before WAL is durable
   through its `pageLSN`.
-- Commit is not acknowledged before its commit record is durable.
+- Commit is not acknowledged before its commit record is durable, unless the
+  transaction logged no action and carries no Raft index: nothing depends on
+  that record surviving a crash.
 - Database pages are not forced at commit.
 - WAL append buffers must own record bytes; they cannot retain spans into
   mutable cached pages.

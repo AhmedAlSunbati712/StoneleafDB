@@ -24,6 +24,8 @@ public:
     std::uint64_t term_at(std::uint64_t index) const;
     void truncate_suffix(std::uint64_t from_index);
     void sync();
+    // As Segment::sync_store: durability needs only the Store.
+    void sync_store();
 
     bool is_maxed() const;
     std::uint64_t base_index() const;

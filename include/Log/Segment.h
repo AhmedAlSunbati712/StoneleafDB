@@ -46,6 +46,11 @@ class Segment {
 
         /// Synchronizes authoritative Store bytes before derived Index bytes.
         void sync();
+        // Syncs only the authoritative Store, which is all a durability
+        // boundary needs: recovery rebuilds any Index entry that did not
+        // survive. Halves the full syncs on the commit path. sync() still
+        // syncs both, for close, so a clean reopen has nothing to rebuild.
+        void sync_store();
 
         /// Reports whether either configured limit was strictly exceeded.
         bool is_maxed() const;

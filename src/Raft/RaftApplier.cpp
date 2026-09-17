@@ -18,13 +18,11 @@ RaftApplier::RaftApplier(RaftState& state,
                          RaftLog& raft_log,
                          KeyStore& key_store,
                          TransactionManager& transaction_manager,
-                         Log& wal,
                          std::size_t max_apply_batch_size)
     : state_(state),
       raft_log_(raft_log),
       key_store_(key_store),
       transaction_manager_(transaction_manager),
-      wal_(wal),
       max_apply_batch_size_(std::max<std::size_t>(max_apply_batch_size, 1)) {}
 
 void RaftApplier::run() {
@@ -46,8 +44,8 @@ std::size_t RaftApplier::apply_pending_batch() {
     std::uint64_t first_index = 0;
     std::uint64_t last_index = 0;
     {
-        // Copy the batch bounds out and release the lock: the B-tree work and
-        // the fsync below must not run under state_mutex.
+        // Copy the batch bounds out and release the lock: the B-tree work must
+        // not run under state_mutex.
         std::lock_guard lock(state_.state_mutex);
         if (state_.commit_index() <= state_.last_applied()) return 0;
 
@@ -57,7 +55,6 @@ std::size_t RaftApplier::apply_pending_batch() {
             first_index + max_apply_batch_size_ - 1);
     }
 
-    Lsn batch_commit_lsn = 0;
     for (std::uint64_t index = first_index; index <= last_index; ++index) {
         const RaftMutationEntry entry = raft_log_.read(index);
 
@@ -97,18 +94,20 @@ std::size_t RaftApplier::apply_pending_batch() {
             }
         }
 
-        // Defer the sync: one fsync covers the whole batch below. The entry's
-        // index goes in the commit record, so recovery can rebuild
-        // last_applied from the WAL alone.
+        // Not synced. The entry's index goes in the commit record, so recovery
+        // can rebuild last_applied from the WAL alone.
         if (transaction_manager_.commit(transaction, Durability::Defer, index) != CommitStatus::Success) {
             throw std::runtime_error(describe(index, "commit failed"));
         }
-        batch_commit_lsn = transaction->last_lsn();
     }
 
-    // Durable before the watermark moves: sessions wake on last_applied and
-    // immediately report success to their client.
-    wal_.sync_through(batch_commit_lsn);
+    // No WAL sync before the watermark moves, although sessions wake on it and
+    // reply success. The entry is already durable where it counts: it is
+    // committed, so it is in the Raft log of a majority. The WAL tail only
+    // records having applied it, and losing that tail is safe - no page reaches
+    // the database file before its WAL is durable, so a crash leaves a state
+    // that is exactly some prefix of the Raft log, recovery reports that
+    // prefix as last_applied, and the rest is applied again once committed.
 
     {
         std::lock_guard lock(state_.state_mutex);

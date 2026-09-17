@@ -77,7 +77,7 @@ protected:
         const Key &key,
         Value value
     ) {
-        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        PendingBTreeAction action(transaction->id(), transaction_manager->prepare_to_log(transaction));
         action.set_undo(InsertUndo{key});
         return tree->insert(transaction, key, value, action);
     }
@@ -90,7 +90,7 @@ protected:
         if (previous.status != BTreeStatus::Success) {
             return BTreeRemoveStatus{.status = previous.status};
         }
-        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        PendingBTreeAction action(transaction->id(), transaction_manager->prepare_to_log(transaction));
         action.set_undo(DeleteUndo{key, previous.value});
         return tree->remove(transaction, key, action);
     }

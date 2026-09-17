@@ -56,6 +56,7 @@ RaftLog::RaftLog(Config config) : config_(config) {
 
 RaftLog::~RaftLog() noexcept {
     std::unique_lock lock(mutex_);
+    wait_for_sync_to_finish(lock);
     segments_.clear();
 }
 
@@ -140,6 +141,7 @@ void RaftLog::open(const std::string& directory) {
 
 void RaftLog::close() {
     std::unique_lock lock(mutex_);
+    wait_for_sync_to_finish(lock);
     if (segments_.empty()) return;
     if (recovery_required_) {
         throw std::runtime_error("Raft log must be reopened before close");
@@ -243,6 +245,29 @@ std::vector<RaftMutationEntry> RaftLog::scan_from(std::uint64_t index) const {
     return entries;
 }
 
+std::vector<RaftMutationEntry> RaftLog::read_range(
+    std::uint64_t first_index,
+    std::size_t max_count) const {
+    std::shared_lock lock(mutex_);
+    if (segments_.empty()) throw std::runtime_error("Raft log is not open");
+    if (first_index == 0 || first_index > next_index_) {
+        throw std::out_of_range("Raft range start is outside the log");
+    }
+
+    const std::uint64_t available = next_index_ - first_index;
+    const std::uint64_t count = std::min<std::uint64_t>(available, max_count);
+    std::vector<RaftMutationEntry> entries;
+    entries.reserve(static_cast<std::size_t>(count));
+
+    std::size_t segment = 0;
+    for (std::uint64_t index = first_index; index < first_index + count; ++index) {
+        // Indexes only increase, so the containing segment only moves forward.
+        while (index >= segments_[segment]->next_index()) ++segment;
+        entries.push_back(segments_[segment]->read(index));
+    }
+    return entries;
+}
+
 std::uint64_t RaftLog::last_index() const noexcept {
     std::shared_lock lock(mutex_);
     return next_index_ == 0 ? 0 : next_index_ - 1;
@@ -267,6 +292,9 @@ std::uint64_t RaftLog::term_at(std::uint64_t index) const {
 
 void RaftLog::truncate_suffix(std::uint64_t from_index) {
     std::unique_lock lock(mutex_);
+    // An in-flight sync holds segment pointers this may erase, and would
+    // otherwise mark the replaced suffix durable when it finishes.
+    wait_for_sync_to_finish(lock);
     if (segments_.empty()) throw std::runtime_error("Raft log is not open");
     if (recovery_required_) throw std::runtime_error("Raft log must be reopened before truncating");
     if (from_index == 0 || from_index > next_index_) {
@@ -328,20 +356,54 @@ void RaftLog::sync_through(std::uint64_t index) {
     if (index == 0 || index >= next_index_) {
         throw std::out_of_range("Raft durability target is not present in log");
     }
-    if (index <= durable_index_ && !directory_dirty_) return;
 
+    // Group commit: see Log::sync_through. A waiter re-validates after waking,
+    // because a truncation may have run between the in-flight sync and now.
+    while (true) {
+        if (index <= durable_index_ && !directory_dirty_) return;
+        if (!sync_in_progress_) break;
+        sync_done_.wait(lock);
+        if (segments_.empty()) throw std::runtime_error("Raft log was closed during synchronization");
+        if (index >= next_index_) {
+            throw std::out_of_range("Raft durability target was truncated during synchronization");
+        }
+    }
+
+    const std::uint64_t sync_goal = next_index_ - 1;
+    std::vector<RaftSegment*> to_sync;
     for (auto& segment : segments_) {
         if (segment->next_index() == segment->base_index()) continue;
-        const std::uint64_t segment_last = segment->next_index() - 1;
-        if (segment_last <= durable_index_) continue;
-        segment->sync();
-        durable_index_ = segment_last;
-        if (durable_index_ >= index) break;
+        if (segment->next_index() - 1 <= durable_index_) continue;
+        to_sync.push_back(segment.get());
     }
-    if (directory_dirty_) {
-        disk::sync_directory(directory_);
-        directory_dirty_ = false;
+    const bool sync_directory = directory_dirty_;
+    const std::string directory = directory_;
+    directory_dirty_ = false;
+    sync_in_progress_ = true;
+    lock.unlock();
+
+    try {
+        // Store only; see Log::sync_through.
+        for (RaftSegment* segment : to_sync) segment->sync_store();
+        if (sync_directory) disk::sync_directory(directory);
+    } catch (...) {
+        lock.lock();
+        if (sync_directory) directory_dirty_ = true;
+        sync_in_progress_ = false;
+        sync_done_.notify_all();
+        throw;
     }
+
+    lock.lock();
+    // No truncation ran meanwhile - it waits for this sync - so every index up
+    // to sync_goal is still the entry that was just made durable.
+    durable_index_ = std::max(durable_index_, sync_goal);
+    sync_in_progress_ = false;
+    sync_done_.notify_all();
+}
+
+void RaftLog::wait_for_sync_to_finish(std::unique_lock<std::shared_mutex>& lock) {
+    sync_done_.wait(lock, [this] { return !sync_in_progress_; });
 }
 
 std::uint64_t RaftLog::durable_index() const noexcept {

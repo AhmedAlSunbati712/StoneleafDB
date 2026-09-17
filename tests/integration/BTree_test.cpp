@@ -94,7 +94,7 @@ public:
         const Key &key,
         Value value
     ) {
-        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        PendingBTreeAction action(transaction->id(), transaction_manager.prepare_to_log(transaction));
         BTreeGetStatus previous = tree.get(key);
         if (previous.status == BTreeStatus::Success) {
             action.set_undo(UpdateUndo{key, previous.value});
@@ -112,7 +112,7 @@ public:
         if (previous.status != BTreeStatus::Success) {
             return BTreeRemoveStatus{.status = previous.status};
         }
-        PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+        PendingBTreeAction action(transaction->id(), transaction_manager.prepare_to_log(transaction));
         action.set_undo(DeleteUndo{key, previous.value});
         return tree.remove(transaction, key, action);
     }
@@ -195,7 +195,7 @@ TEST_F(BTreeIntegrationTest, MutationActionCollectsCompleteDeduplicatedEffects) 
     TransactionHandle transaction = harness.transaction_manager.begin();
     Key key = make_key(7);
     Value value = ValueCodec::make_char("A");
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), harness.transaction_manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{key});
 
     ASSERT_EQ(
@@ -222,7 +222,7 @@ TEST_F(BTreeIntegrationTest, TransactionalInsertAppendsWalAndInstallsAssignedLsn
     TransactionHandle transaction = harness.transaction_manager.begin();
     Key key = make_key(7);
     Value value = ValueCodec::make_char("A");
-    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    PendingBTreeAction action(transaction->id(), harness.transaction_manager.prepare_to_log(transaction));
     action.set_undo(InsertUndo{key});
 
     ASSERT_EQ(

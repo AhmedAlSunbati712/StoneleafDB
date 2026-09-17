@@ -223,8 +223,19 @@ struct MutationOp {
 //
 // nullopt is a tombstone (this transaction deleted the key), which is a
 // different state from the key simply being absent from the map.
+// Key deliberately has no comparison operators - the engine compares keys
+// through KeyCodec::compare - so the map needs an explicit comparator. Giving
+// Key a defaulted operator<=> instead would order by (type, size, data), which
+// is NOT the order the storage engine uses; two disagreeing key orderings in one
+// codebase is the kind of defect that surfaces much later as a corrupt index.
+struct KeyOrder {
+    bool operator()(const Key& lhs, const Key& rhs) const {
+        return KeyCodec::compare(lhs, rhs) < 0;
+    }
+};
+
 struct TransactionWriteBuffer {
-    std::map<Key, std::optional<Value>> writes;
+    std::map<Key, std::optional<Value>, KeyOrder> writes;
 
     // Collapses repeated writes to the same key into last-write-wins, so
     // put(k,1); put(k,2) produces a single MutationOp.
@@ -295,7 +306,9 @@ A session that arrives at a follower is rejected at accept time, before a handle
 
 The redirect must carry the leader's **client** address. `leader_raft_address` is learned from `AppendEntries`, so it is the leader's Raft (gRPC) address; a client sent there would reach the gRPC port and fail the protocol. `leader_client_address()` translates it through `cluster_nodes` (see *Raft State*).
 
-That check is a fast path, not the correctness-critical one. **Leadership can change mid-session** — a transaction may open while we are leader, buffer writes for seconds, and reach `COMMIT` after we have been deposed. So the propose path re-checks, and the re-check must be atomic with the append: verifying leadership, reading `current_term`, and appending happen under a single hold of `state_mutex`. Split them and a deposed server stamps an entry with a stale term, which a new leader then truncates while the session waits on an index that will never apply.
+That check is a fast path, not the correctness-critical one. **Leadership can change mid-session** — a transaction may open while we are leader, buffer writes for seconds, and reach `COMMIT` after we have been deposed. So the propose path re-checks, and the re-check must be serialized with every other writer of the log tail: verifying leadership, reading `current_term`, and appending all happen under one hold of `RaftState::append_mutex`. Only the check and the term read take `state_mutex` as well; the append itself holds `append_mutex` alone, because it is a write, and a write can stall for milliseconds behind a full sync of another file on the same volume. Held under `state_mutex`, that stall blocked heartbeats, replication and commit advancement, serialized commits, and let followers time out into elections under sustained load.
+
+Leadership can still be lost between the check and the append, so the entry may carry a stale term. That is safe. The only other writer of the tail is the `AppendEntries` receiver, and it takes `append_mutex` first, so no newer-term entry can land before ours: the log's terms stay non-decreasing. A later leader either overwrites the entry — `await_commit` sees the term at that index change and reports `Failed` — or, if it holds the entry too, commits it along with one of its own. Lock order is `append_mutex` → `state_mutex` → `raft_log_mutex`.
 
 ### Returning the commit result
 The apply loop returns nothing to the session, because there is nothing for it to return. **Every client-visible result is already determined during execution, before the entry is proposed.** A read was answered from the write buffer or the KeyStore at the time it was issued; a write was recorded in the buffer and answered then; a deadlock victim failed before any entry existed. By the time an entry is committed, applying it is *mandatory* — every node must apply it or diverge — so there is no per-transaction failure the apply loop could report. It only signals **completion**, and `last_applied` already does that.
@@ -325,6 +338,21 @@ This costs nothing on the now-follower: the apply path takes no logical locks, s
 The truncation path in the `AppendEntries` receiver must therefore call `applied_cv.notify_all()`, or a session whose entry was just discarded sits until `COMMIT_TIMEOUT` and reports `Unknown` for something provably `Failed`.
 
 **If the apply loop itself fails** — an I/O error, a full disk — that is not a transaction result. A committed entry must be applied on every node, so a node that cannot apply it cannot stay in the cluster. The apply loop halts the process rather than skipping the entry or reporting an error upward; recovery then replays from the Raft log on restart.
+### Serving consistent reads
+A read answered from local state is only correct if the node answering it is still the leader. Nothing in a node's own state establishes that: a partitioned leader is never told it was deposed, so it keeps answering while a new leader accepts writes it will never see. Applying up to its own `commit_index` does not help, because the entries it is missing were committed elsewhere.
+
+So a read passes three gates (`RaftReadIndex`), Raft's read-index rule (§6.4/§8):
+
+1. **The leadership's no-op must be committed.** A leader may commit by counting replicas only for entries of its own term (Figure 8), so until then `commit_index` can sit below the true committed prefix and a read taken against it could miss a committed write. `RaftElection` appends one entry with no operations on every election win, syncs it, and counts it; `leader_term_first_index()` is what the read waits for. One per leadership, not per read.
+2. **A majority must confirm leadership, after the read arrived.** The leader opens a numbered round (`start_read_round()`), the replication threads carry that number on their next `AppendEntries`, and each reply credits it (`record_read_ack()`). Confirmation is the (majority − 1)-th largest peer acknowledgement, counting the leader itself. The number is what makes the proof honest: a reply to a round that opened *before* the read says nothing about the present. A reply counts whether or not the entries were accepted — it proves the peer still recognizes this term, which is the whole question — and any reply carrying a higher term steps this node down instead.
+3. **The state machine must have applied through the `commit_index` taken in step 1.** Committed is not applied; without this the read could miss a write that was already committed when it arrived. This wait is deliberately not gated on still leading: a committed entry is applied by every node, and the read is entitled to it.
+
+**Why a heartbeat is enough, and why this is cheap.** Elections need a majority too, and any two majorities overlap, so a successful majority is impossible once a newer leader exists. The round is ordinary heartbeats: no log entry, no WAL record, no fsync. And one round satisfies every read waiting when it opens, so the cost per read falls as concurrency rises — unlike replicating an entry per read, which would put every read through the write pipeline and the disk.
+
+**What a client sees.** `Ready` serves the read. `NotLeader` is returned by a follower, and by a leader deposed while waiting — the client must go to the leader, which needs the redirect the wire protocol still lacks. `Timeout` (`READ_TIMEOUT`, 1s) is what a partitioned leader answers: bounded well below `COMMIT_TIMEOUT`, because a read is cheap to retry and a client waiting on an unreachable majority wants to be told quickly.
+
+**Consequences.** Reads no longer scale across followers: every consistent read lands on the leader. A session's own buffered writes are still answered from its `TransactionWriteBuffer` without a round, since that is its own data. Serving reads from followers, or letting a client opt into a stale local read, stays possible but must be an explicit choice in the request rather than the default. A **leader lease** — remembering that a majority acknowledged us at time *T* and skipping step 2 until *T + lease*, with the lease below `ELECTION_TIMEOUT_MIN` — removes the round trip entirely, at the cost of a clock-drift assumption this design does not otherwise make. That is the natural follow-up, not a prerequisite.
+
 ## Lifecycle of an interactive multi-command mutation Transaction
 Basically the same as of the single command except that we don't propose the cluster unless a commit statement is reached. We allow **read-your-own-writes** (we will discuss reads in another subsection) from the session's `TransactionWriteBuffer`: a read first consults the buffer and falls through to the KeyStore on a miss. Note this is *not* a dirty read — a dirty read is seeing another transaction's uncommitted writes, which the locks held for the duration of the transaction specifically prevent. A transaction only ever sees its own uncommitted writes. New write operations are recorded in the `TransactionWriteBuffer` associated with this session. Locks are held for the whole duration until the transaction either fully commits and is applied to the state machine or is aborted. Furthermore, no changes are applied to the local state machine (the database) until the entry is replicated on a majority of servers
 ## Applying a committed Raft entry
@@ -341,7 +369,7 @@ The reason it must not acquire locks is *not* that no locks are involved. On the
 
 So the apply loop is not running lock-free — on the leader it runs *inside* an exclusion someone else already holds. If it tried to acquire X(`k`) itself it would block forever on the session's own X(`k`), which is exactly the self-deadlock this design has to avoid. Page latches still apply for physical consistency; only the `LockManager` is bypassed.
 
-(The reader-exclusion argument holds while reads are leader-only. Serving reads from followers later would need MVCC or latch-level snapshots.)
+(The reader-exclusion argument holds while reads are leader-only, which *Serving consistent reads* now enforces. Serving reads from followers later would need MVCC or latch-level snapshots.)
 
 **Interface.** Rather than a separate apply-only method on `KeyStore`, locking becomes a caller-supplied parameter on the existing methods. An enum rather than a bare `bool`, since `put(txn, k, v, false)` tells a reader nothing at the call site and this flag switches off a safety property:
 
@@ -384,7 +412,7 @@ The commit record is the right home for it rather than the record header: it is 
 
 One thing to verify when implementing: `TransactionManager::commit` calls `release_locks`, which for an apply transaction runs against an empty lock set. That should be a no-op, but confirm it does not assert.
 
-**`last_applied` advances only after the WAL is synced.** Sessions wake on `last_applied >= idx` and immediately reply success to the client, so advancing it before `flush wal log` would report a commit that is not yet durable. The batch is applied, then flushed, then the watermark moves.
+**`last_applied` advances without a WAL sync.** Sessions wake on `last_applied >= idx` and immediately reply success, and that is safe with the WAL tail unsynced because the WAL is not what makes the write durable: a committed entry is already in the Raft log of a majority. The WAL tail only records *having applied* it. If a crash loses that tail, WAL-before-data guarantees no page from it reached the database file, so the node comes back in exactly the state of some Raft log prefix; recovery reports that prefix as `last_applied` (*Seeding `commit_index` and `last_applied` on startup*), and the remaining committed entries are applied again. An earlier design synced here, which cost a full sync per batch on the leader's commit path for no durability it did not already have.
 
 ```
 apply loop:
@@ -398,11 +426,11 @@ apply loop:
             switch operation.type:
                 case Put:    KeyStore.put(txn, operation.key, operation.value, Locking::Skip)
                 case Delete: KeyStore.remove(txn, operation.key, Locking::Skip)
-        TxnMgr.commit(txn, Durability::Defer)   // no fsync yet; the batch syncs once below
+        TxnMgr.commit(txn, Durability::Defer)   // never synced here; see above
         batch_end++
         num_applied++
-    flush wal log
-    // Durable only now, so only now may a waiting session reply success.
+    // The entries are durable in the Raft log already; a lost WAL tail is
+    // re-applied after recovery.
     last_applied <- batch_end
     notify waiting sessions
 ```
@@ -479,6 +507,11 @@ class RaftLog {
 
         RaftMutationEntry              read(std::uint64_t index) const;
         std::vector<RaftMutationEntry> scan_from(std::uint64_t index) const;
+        // At most max_count entries from first_index, read through the index.
+        // The replicator uses this: scan_from() decodes every segment from
+        // index onward, and the replicator reads under state_mutex.
+        std::vector<RaftMutationEntry> read_range(std::uint64_t first_index,
+                                                  std::size_t max_count) const;
 
         std::uint64_t last_index() const noexcept;
         std::uint64_t last_term()  const noexcept;
@@ -521,6 +554,8 @@ One rule: **an entry must be durable before anything is told it exists.** Concre
 - A **leader** calls `sync_through(idx)` before its own entry counts toward the majority in `advance_commit_index()`. The leader counts itself, so its own copy has to be as durable as any follower's.
 
 Both sync **once per batch**, not per entry — an `AppendEntries` carrying twenty entries is one `fsync`, which is what makes throughput scale with load rather than collapse under it.
+
+`sync_through` is also a **group commit** across callers: one thread fsyncs at a time with the log mutex released, taking every entry appended so far, and concurrent proposers wait for it and usually find their entry covered. `truncate_suffix()` waits for an in-flight sync — the sync holds pointers to segments truncation may erase, and finishing it after a truncation would mark the replaced suffix durable.
 
 ### Persisting `current_term` and `voted_for`
 These are Raft's other durable state and they do not belong in either log — the Raft log gets truncated, the WAL is for the state machine, and these two fields are neither. They live in a small fixed-layout file in the same `<db>.raft/` directory:
@@ -610,6 +645,15 @@ advance_commit_index():
             notify the apply loop
             break
 ```
+
+**`advance_commit_index()` has two callers, not one.** Every replication thread calls it after a peer accepts entries — and the **proposing session** calls it too, once its own copy reaches disk. The second is not an optimization. A single-node cluster has no replication threads at all, so without that caller nothing would ever commit; and even in a larger cluster the leader's own `fsync` completing is frequently what forms the majority, since the leader counts toward its own quorum.
+
+That is also why it lives in its own translation unit rather than inside the replicator: the replicator's implementation includes the generated gRPC headers, and defining this beside it would drag protobuf and gRPC into the core library and therefore into every binary that links it. Keeping it proto-free is what lets the session path call it.
+
+**The leader counts itself only once `durable_index() >= N`.** Rather than calling `sync_through()` here — which would hold `state_mutex` across an `fsync` — the propose path syncs after appending with the lock released, and this test simply observes the result. Same guarantee, no I/O under the state lock.
+
+**`send_next` starts optimistic, so catching up a lagging follower costs round trips.** `become_leader()` sets `send_next[i] = last_index + 1` for every peer. If a follower's log is shorter, the first `AppendEntries` carries no entries at all, fails the consistency check, and backs `send_next` off by one — so convergence takes one round trip per missing entry. This is the O(entries) behaviour the paper's conflicting-term hint replaces with O(terms). It self-corrects promptly because the replication thread waits for the heartbeat only while `send_next > last_index`; while backing off it retries immediately.
+
 ### Messages
 ```c++
 struct AppendEntriesRequest {
@@ -705,7 +749,7 @@ on AppendEntries(term, leader, prev_index, prev_term, entries, leader_commit):
 
 **But the sync is guarded, because `sync_through()` rejects index 0.** Raft indexes start at 1, so `sync_through(0)` is a caller bug and throws `std::out_of_range`. `prev_index + len(entries)` is 0 only when `prev_index` is 0 and `entries` is empty: a heartbeat to a follower whose log is still empty, which is exactly what a freshly elected leader sends before any client write. Unguarded, that throws out of the RPC handler on the first heartbeat of every new cluster. Nothing needs syncing in that case — there is nothing in the log to make durable.
 
-**A deliberate exception to the locking rule.** This handler holds `state_mutex` across `sync_through()`, which is I/O — one of the two places the rule under *Locking discipline* is broken on purpose (the other is persisting term and vote). Releasing the lock between the state decision and the log write would let a concurrent `AppendEntries` from a different term interleave its truncation with ours, and the check would no longer mean anything by the time we acted on it. The cost is acceptable because a follower has nothing else to do: its sessions are idle, other `AppendEntries` must serialize anyway, and the election timer was just reset so it cannot fire during the write. Lock ordering is still `state_mutex` → `raft_log_mutex`, which is exactly the inversion this handler would otherwise introduce by consulting the log before taking Raft state.
+**A deliberate exception to the locking rule.** This handler holds `state_mutex` across `sync_through()`, which is I/O — one of the two places the rule under *Locking discipline* is broken on purpose (the other is persisting term and vote). Releasing the lock between the state decision and the log write would let a concurrent `AppendEntries` from a different term interleave its truncation with ours, and the check would no longer mean anything by the time we acted on it. The cost is acceptable because a follower has nothing else to do: its sessions are idle, other `AppendEntries` must serialize anyway, and the election timer was just reset so it cannot fire during the write. Lock ordering is `append_mutex` → `state_mutex` → `raft_log_mutex`: the handler takes `append_mutex` first so a local proposal cannot append between its consistency check and its truncation, then Raft state before consulting the log, which is exactly the inversion it would otherwise introduce.
 
 ## Raft State
 An object that will live on every server and used extensively through the controller layer (the client handler, replication and follower threads).
@@ -1065,6 +1109,8 @@ It is *only* a lower bound. Entries above it may or may not be committed, and **
 **We do not apply the log tail at startup.** Entries above `last_applied` are replicated but not necessarily committed — a follower appends entries long before they commit, and `AppendEntries` rule 3 truncates and replaces conflicting suffixes as a matter of normal operation, not as an error path. Applying them at boot would be unrecoverable: those apply transactions carry their own `TxnCommit` records, so ARIES will not undo them, and the node diverges permanently. The rule holds everywhere, startup included: **never apply past `commit_index`.**
 
 This requires the `raft_index` field on `CommitPayload` described under *Applying a committed Raft entry*.
+
+**The watermark must outlive WAL cleanup.** Recovery ends by deleting every segment except the active one, and nothing guarantees the active segment holds an applied entry's commit record — client transactions alone can fill segments. Without care, the next restart reads a watermark of 0 and re-applies the Raft log from index 1 on top of a tree that already holds it; the apply loop fails and the node aborts on every start. So before cleanup, `finish_recovery()` re-records `last_applied` in the active segment as a synced commit of an empty transaction whose `raft_index` is the recovered watermark. Step 2 then finds it on the next start however much was deleted.
 
 ## Leader Election
 Servers start as followers. A follower that reaches its election deadline without hearing from a leader becomes a candidate and starts an election. The timer itself — what resets it, and why it is a deadline rather than a cancellable timer — is described under *Locking discipline*; this section covers what happens once it fires.

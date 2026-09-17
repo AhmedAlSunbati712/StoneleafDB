@@ -45,8 +45,11 @@ struct StoreScanResult {
 /// caller must not access or mutate the file through another descriptor while
 /// the Store exists.
 ///
-/// Reads may run concurrently. Append, tail repair, and synchronization are
-/// serialized. Successful append makes bytes visible to reads but does not
+/// Reads may run concurrently. Append and tail repair are serialized.
+/// Synchronization runs alongside them: it makes durable at least every append
+/// that returned before it was called, so it never needs to stall a writer.
+/// The owner must not close the Store while a sync is in flight. Successful
+/// append makes bytes visible to reads but does not
 /// make them crash-durable; callers use `sync()` at the WAL durability
 /// boundary.
 class Store {
