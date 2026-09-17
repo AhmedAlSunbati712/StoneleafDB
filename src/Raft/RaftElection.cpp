@@ -144,5 +144,35 @@ bool RaftElection::campaign() {
     }
 
     for (std::thread& voter : voters) voter.join();
+
+    // A leader may only commit an entry of its own term by counting replicas
+    // (Figure 8), so until one exists commit_index can sit below the true
+    // committed prefix. Read-index confirmation needs commit_index to be
+    // accurate, so every leadership starts by appending one no-op.
+    if (won.load()) append_leader_noop();
     return won.load();
+}
+
+void RaftElection::append_leader_noop() {
+    std::uint64_t index = 0;
+    std::uint64_t term = 0;
+
+    {
+        std::lock_guard append_lock(state_.append_mutex);
+        {
+            std::lock_guard lock(state_.state_mutex);
+            // Deposed between winning and here: the next leader appends its own.
+            if (state_.state() != State::Leader) return;
+            term = state_.current_term();
+        }
+
+        index = raft_log_.append(term, {});
+
+        std::lock_guard lock(state_.state_mutex);
+        if (state_.state() == State::Leader && state_.current_term() == term) {
+            state_.set_leader_term_first_index(index);
+        }
+    }
+
+    state_.replication_cv.notify_all();
 }

@@ -46,6 +46,12 @@ public:
     bool campaign();
 
 private:
+    // Appends one entry with no operations, carrying the new leadership's
+    // term, and records its index as leader_term_first_index(). Called after
+    // the vote threads join, never from inside one: the append takes
+    // append_mutex, and a voter already holds state_mutex.
+    void append_leader_noop();
+
     RaftState& state_;
     RaftLog& raft_log_;
     RaftPeerClients& peers_;
