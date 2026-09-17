@@ -215,6 +215,21 @@ TEST_F(RaftApplierTest, AppliesEnoughDistinctKeysToSplitLeaves) {
     }
 }
 
+TEST_F(RaftApplierTest, ApplyingDoesNotSyncTheWal) {
+    // The Raft log, durable on a majority, is the durability point for an
+    // applied entry. The WAL tail may stay unsynced: if a crash loses it,
+    // recovery reports a lower watermark and the entries are applied again.
+    append_and_commit({{put_op(1, "a")}, {put_op(2, "b")}});
+    const Lsn durable_before = wal->durable_lsn();
+
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    EXPECT_EQ(applier.apply_pending_batch(), 2u);
+
+    EXPECT_EQ(last_applied(), 2u);
+    EXPECT_EQ(wal->durable_lsn(), durable_before);
+    EXPECT_GT(wal->next_lsn() - 1, durable_before);
+}
+
 TEST_F(RaftApplierTest, AppliesAKeyAnotherTransactionHoldsExclusively) {
     // The leader's proposing session still holds X on this key while the entry
     // applies. With Locking::Acquire the applier would block on it forever.

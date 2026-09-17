@@ -256,4 +256,100 @@ TEST_F(RecoveryWatermarkTest, PagesRestoredOnlyByRedoAreReadable) {
     ASSERT_EQ(store.close(), KeyStoreStatus::Success);
 }
 
+TEST_F(RecoveryWatermarkTest, AnUnsyncedApplyTailLostInACrashIsReappliedFromTheRaftLog) {
+    // Crash image: the WAL as of a sync after entry 5. Entries 6-10 were then
+    // applied - and acknowledged - without a WAL sync, and that tail is lost.
+    // The Raft log still holds all ten, as it would on a majority.
+    const std::filesystem::path image = temp_dir / "crash-image";
+    {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(recovery_wal_config());
+        wal.open(db_file + ".wal");
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        RaftLog raft_log(recovery_wal_config());
+        raft_log.open(db_file + ".raft");
+        RaftHardStateStore hard_state;
+        hard_state.open((temp_dir / "hardstate").string());
+        RaftState state(
+            std::vector<ClusterMember>{
+                {.raft = SELF_RAFT, .database_server = SELF_CLIENT},
+                {.raft = PEER_RAFT, .database_server = PEER_CLIENT},
+            },
+            SELF_CLIENT, hard_state, 0);
+        RaftApplier applier(state, raft_log, store, transaction_manager, wal);
+
+        for (std::uint64_t id = 1; id <= 10; ++id) raft_log.append(1, {put_op(id, "a")});
+        raft_log.sync_through(10);
+
+        {
+            std::lock_guard lock(state.state_mutex);
+            state.set_commit_index(5);
+        }
+        while (applier.apply_pending_batch() > 0) {}
+        wal.sync_through(wal.next_lsn() - 1);
+        // No page reaches the database file before its WAL is durable, so the
+        // file plus the synced WAL is exactly what a crash here leaves.
+        std::filesystem::create_directories(image);
+        std::filesystem::copy_file(db_file, image / "test.db");
+        std::filesystem::copy(db_file + ".wal", image / "test.db.wal",
+                              std::filesystem::copy_options::recursive);
+
+        {
+            std::lock_guard lock(state.state_mutex);
+            state.set_commit_index(10);
+        }
+        while (applier.apply_pending_batch() > 0) {}
+        // Abandoned without close: the unsynced tail never reaches the image.
+    }
+
+    std::filesystem::remove(db_file);
+    std::filesystem::remove_all(db_file + ".wal");
+    std::filesystem::copy_file(image / "test.db", db_file);
+    std::filesystem::copy(image / "test.db.wal", db_file + ".wal",
+                          std::filesystem::copy_options::recursive);
+
+    KeyStore store;
+    LockManager lock_manager;
+    Log wal(reopened_wal_config(db_file));
+    TransactionManager transaction_manager(wal, lock_manager, store);
+    store.attach_transaction_manager(transaction_manager);
+    wal.open(db_file + ".wal");
+    std::unordered_map<TransactionId, Lsn> unresolved;
+    std::uint64_t last_applied = 0;
+    aries_recovery_redo(wal, db_file, unresolved, last_applied);
+    ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+    aries_recovery_undo(wal, store, unresolved);
+    finish_recovery(transaction_manager, db_file, last_applied);
+    EXPECT_EQ(last_applied, 5u);
+
+    RaftLog raft_log(recovery_wal_config());
+    raft_log.open(db_file + ".raft");
+    RaftHardStateStore hard_state;
+    hard_state.open((temp_dir / "hardstate").string());
+    RaftState state(
+        std::vector<ClusterMember>{
+            {.raft = SELF_RAFT, .database_server = SELF_CLIENT},
+            {.raft = PEER_RAFT, .database_server = PEER_CLIENT},
+        },
+        SELF_CLIENT, hard_state, last_applied);
+    {
+        std::lock_guard lock(state.state_mutex);
+        state.set_commit_index(10);
+    }
+    RaftApplier applier(state, raft_log, store, transaction_manager, wal);
+    while (applier.apply_pending_batch() > 0) {}
+
+    for (std::uint64_t id = 1; id <= 10; ++id) {
+        TransactionHandle reader = transaction_manager.begin();
+        const KeyStoreGetResult result =
+            store.get(reader, KeyCodec::encode(KeyInput{id}).value());
+        EXPECT_EQ(result.status, KeyStoreStatus::Success) << "key " << id;
+        ASSERT_EQ(transaction_manager.commit(reader), CommitStatus::Success);
+    }
+    ASSERT_EQ(store.close(), KeyStoreStatus::Success);
+}
+
 } // namespace
