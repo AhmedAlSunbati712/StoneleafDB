@@ -81,6 +81,7 @@ Lsn TransactionManager::append_action(const TransactionHandle& transaction, Pend
 
     const Lsn action_lsn = log_.append(std::move(action));
     transaction->last_lsn_ = action_lsn;
+    transaction->logged_action_ = true;
     return action_lsn;
 }
 
@@ -101,7 +102,11 @@ CommitStatus TransactionManager::commit(const TransactionHandle& transaction,
     const Lsn commit_lsn = log_.append(
         WalRecords::commit(transaction->id_, transaction->last_lsn_, raft_index));
     transaction->last_lsn_ = commit_lsn;
-    if (durability == Durability::Sync) {
+    // A transaction that logged no action changed nothing, so losing its
+    // commit record in a crash loses nothing - unless the record carries a
+    // Raft index, which recovery reads back as the applied watermark.
+    const bool decision_matters = transaction->logged_action_ || raft_index != 0;
+    if (durability == Durability::Sync && decision_matters) {
         log_.sync_through(commit_lsn);
     }
 
@@ -202,7 +207,9 @@ AbortStatus TransactionManager::abort(const TransactionHandle& transaction, Abor
     // two-phase locks are released and the transaction disappears.
     const Lsn end_lsn = log_.append(WalRecords::end(transaction->id_, transaction->last_lsn_));
     transaction->last_lsn_ = end_lsn;
-    log_.sync_through(end_lsn);
+    // With no action there was nothing to undo, and recovery ends an
+    // unfinished transaction the same way, so the end need not be durable.
+    if (transaction->logged_action_) log_.sync_through(end_lsn);
 
     {
         std::unique_lock lock(transactions_mutex_);

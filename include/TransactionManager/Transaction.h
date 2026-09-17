@@ -64,4 +64,9 @@ private:
     std::optional<Key> waiting_for_key_;
 
     Lsn last_lsn_ = 0;
+
+    // Whether append_action() ever logged a B-tree action for this
+    // transaction. One that never did has nothing to redo or undo, so its
+    // commit or abort decision need not be synced.
+    bool logged_action_ = false;
 };

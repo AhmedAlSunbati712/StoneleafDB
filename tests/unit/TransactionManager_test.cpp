@@ -108,6 +108,10 @@ TEST(TransactionManagerTest, BeginCreatesOwnedTransactionAndWalRecord) {
 TEST(TransactionManagerTest, CommitMakesDecisionDurableAndRemovesTransaction) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    action.set_undo(InsertUndo{KeyCodec::make_string("key")});
+    action.add_effect(effect(7, 'a'));
+    const Lsn action_lsn = fixture.manager.append_action(transaction, action.build());
 
     EXPECT_EQ(fixture.manager.commit(transaction), CommitStatus::Success);
 
@@ -117,13 +121,13 @@ TEST(TransactionManagerTest, CommitMakesDecisionDurableAndRemovesTransaction) {
 
     const WalRecord commit = fixture.log.read(transaction->last_lsn());
     EXPECT_EQ(commit.type, WalRecordType::TxnCommit);
-    EXPECT_EQ(commit.prev_lsn, 1u);
+    EXPECT_EQ(commit.prev_lsn, action_lsn);
     EXPECT_EQ(
         fixture.manager.commit(transaction),
         CommitStatus::TransactionNotFound);
 }
 
-TEST(TransactionManagerTest, AbortWritesDecisionAndDurableEnd) {
+TEST(TransactionManagerTest, AbortWritesDecisionAndEnd) {
     ManagerFixture fixture;
     const TransactionHandle transaction = fixture.manager.begin();
 
@@ -133,7 +137,6 @@ TEST(TransactionManagerTest, AbortWritesDecisionAndDurableEnd) {
 
     EXPECT_EQ(transaction->state(), TransactionState::Aborted);
     EXPECT_FALSE(fixture.manager.find(transaction->id()));
-    EXPECT_GE(fixture.log.durable_lsn(), transaction->last_lsn());
 
     const std::vector<WalRecord> records = fixture.log.scan();
     ASSERT_EQ(records.size(), 3u);
@@ -144,6 +147,57 @@ TEST(TransactionManagerTest, AbortWritesDecisionAndDurableEnd) {
     EXPECT_EQ(
         std::get<AbortPayload>(WalRecords::decode(records[1])).reason,
         AbortReason::StatementFailure);
+}
+
+// A transaction that logged no action has nothing to redo or undo, so its
+// decision need not be durable: after a crash recovery ends it and nothing
+// else. Skipping the sync is what keeps a read off the disk.
+TEST(TransactionManagerTest, CommitOfATransactionThatWroteNothingDoesNotSync) {
+    ManagerFixture fixture;
+    const TransactionHandle transaction = fixture.manager.begin();
+
+    EXPECT_EQ(fixture.manager.commit(transaction), CommitStatus::Success);
+
+    EXPECT_EQ(transaction->state(), TransactionState::Committed);
+    EXPECT_LT(fixture.log.durable_lsn(), transaction->last_lsn());
+}
+
+TEST(TransactionManagerTest, AbortOfATransactionThatWroteNothingDoesNotSync) {
+    ManagerFixture fixture;
+    const TransactionHandle transaction = fixture.manager.begin();
+
+    EXPECT_EQ(
+        fixture.manager.abort(transaction, AbortReason::ClientRequest),
+        AbortStatus::Success);
+
+    EXPECT_EQ(transaction->state(), TransactionState::Aborted);
+    EXPECT_LT(fixture.log.durable_lsn(), transaction->last_lsn());
+}
+
+// A Raft index in the commit record is state recovery depends on - it is the
+// applied watermark - so it syncs even with no action.
+TEST(TransactionManagerTest, CommitCarryingARaftIndexSyncsEvenWithoutActions) {
+    ManagerFixture fixture;
+    const TransactionHandle transaction = fixture.manager.begin();
+
+    EXPECT_EQ(fixture.manager.commit(transaction, Durability::Sync, 7), CommitStatus::Success);
+
+    EXPECT_GE(fixture.log.durable_lsn(), transaction->last_lsn());
+}
+
+TEST(TransactionManagerTest, AbortAfterAnActionMakesTheEndDurable) {
+    ManagerFixture fixture;
+    const TransactionHandle transaction = fixture.manager.begin();
+    PendingBTreeAction action(transaction->id(), transaction->last_lsn());
+    action.set_undo(InsertUndo{KeyCodec::make_string("key")});
+    action.add_effect(effect(7, 'a'));
+    fixture.manager.append_action(transaction, action.build());
+
+    EXPECT_EQ(
+        fixture.manager.abort(transaction, AbortReason::ClientRequest),
+        AbortStatus::Success);
+
+    EXPECT_GE(fixture.log.durable_lsn(), transaction->last_lsn());
 }
 
 TEST(TransactionManagerTest, AbortUndoesActionsAndChainsCompensationRecord) {
