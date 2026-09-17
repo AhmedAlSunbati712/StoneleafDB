@@ -3,6 +3,7 @@
 #include <DiskIO.h>
 #include <Log/WalPayloadCodec.h>
 #include <Log/WalRecords.h>
+#include <V2PageCodec.h>
 
 #include <fcntl.h>
 
@@ -19,10 +20,10 @@
 #include <utility>
 #include <vector>
 
-void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effects) {
+void redo_page_effects(int db_fd, Lsn record_lsn, std::vector<PageEffect>& page_effects) {
     // db_fd is opened once by the caller for the whole redo pass and synced
     // once at the end, rather than per record.
-    for (const PageEffect &effect : page_effects) {
+    for (PageEffect &effect : page_effects) {
         switch (effect.kind) {
             case PageEffectKind::Write:
             case PageEffectKind::Allocate:
@@ -32,6 +33,13 @@ void redo_page_effects(int db_fd, Log& log, std::vector<PageEffect>& page_effect
                 // write regardless of which structural event produced it.
                 // PageEffect already carries page_num directly, so no PageV2
                 // decode is needed just to find where this page lives.
+                //
+                // The image is captured before the record has an LSN, so it
+                // still carries the previous pageLSN and a stale checksum.
+                // Stamp both exactly as Pager does when it publishes the page;
+                // written verbatim, the page fails validation on every read.
+                V2PageCodec::set_page_lsn(effect.after_image, record_lsn);
+                V2PageCodec::update_checksum(effect.after_image);
                 disk::write_exact_at(
                     db_fd,
                     std::span<const char>(effect.after_image),
@@ -74,21 +82,21 @@ void aries_recovery_redo(
                 }
                 case WalRecordType::BTreeAction: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<BTreeActionPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<BTreeActionPayload>(payload).effects);
                     current_offset += 1;
                     unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
                     continue;
                 }
                 case WalRecordType::Compensation: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<CompensationPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<CompensationPayload>(payload).effects);
                     current_offset += 1;
                     unresolved_transactions[txn_id] = static_cast<Lsn>(record.lsn);
                     continue;
                 }
                 case WalRecordType::SystemAction: {
                     WalPayload payload = WalPayloadCodec::decode(record_type, record.data);
-                    redo_page_effects(db_fd, log, std::get<SystemActionPayload>(payload).effects);
+                    redo_page_effects(db_fd, static_cast<Lsn>(record.lsn), std::get<SystemActionPayload>(payload).effects);
                     current_offset += 1;
                     continue;
                 }
