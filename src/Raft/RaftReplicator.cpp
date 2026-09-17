@@ -74,11 +74,13 @@ bool RaftReplicator::replicate_once() {
         prev_index = next > 1 ? next - 1 : 0;
         prev_term = prev_index > 0 ? raft_log_.term_at(prev_index) : 0;
 
+        // Bounded read: this runs under state_mutex, which every proposal,
+        // commit and heartbeat also needs. scan_from() decoded every segment
+        // from next onward just to keep the first batch, so its cost - and
+        // this lock's hold time - grew with the log until heartbeats were late
+        // enough for followers to start elections.
         if (next <= raft_log_.last_index()) {
-            entries = raft_log_.scan_from(next);
-            if (entries.size() > max_entries_per_batch_) {
-                entries.resize(max_entries_per_batch_);
-            }
+            entries = raft_log_.read_range(next, max_entries_per_batch_);
         }
     }
 
