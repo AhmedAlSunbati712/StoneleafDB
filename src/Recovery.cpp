@@ -327,3 +327,21 @@ void cleanup_finalized_segments(const std::string& db_file_name) {
         std::filesystem::remove(entry.path());
     }
 }
+
+void finish_recovery(
+    TransactionManager& transaction_manager,
+    const std::string& db_file_name,
+    std::uint64_t last_applied_raft_index
+) {
+    if (last_applied_raft_index > 0) {
+        // An empty transaction whose commit record carries the watermark.
+        // Commit syncs it, and appends only ever land in the active segment,
+        // which cleanup keeps.
+        TransactionHandle carrier = transaction_manager.begin();
+        if (transaction_manager.commit(carrier, Durability::Sync, last_applied_raft_index)
+                != CommitStatus::Success) {
+            throw std::runtime_error("Failed to persist the Raft watermark before WAL cleanup");
+        }
+    }
+    cleanup_finalized_segments(db_file_name);
+}

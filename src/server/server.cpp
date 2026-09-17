@@ -115,7 +115,7 @@ StartupStatus setup_database(
         // Undo needs the live KeyStore/BTree to actually navigate and mutate
         // the tree.
         aries_recovery_undo(log, key_store, unresolved_transactions);
-        cleanup_finalized_segments(db_file);
+        finish_recovery(transaction_manager, db_file, last_applied_raft_index);
     } catch (const std::exception &error) {
         std::cerr << "[ERROR] Recovery failed: " << error.what() << std::endl;
         return StartupStatus::FAILED;

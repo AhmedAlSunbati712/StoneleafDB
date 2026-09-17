@@ -35,3 +35,12 @@ std::pair<std::uint64_t, bool> parse_wal_segment_name(const std::string& name);
 // Deletes every WAL segment except the active one. Only safe once undo has
 // flushed every page it dirtied to the database file.
 void cleanup_finalized_segments(const std::string& db_file_name);
+
+// The last step of startup recovery: re-records last_applied_raft_index in
+// the active segment, durably, then deletes every finalized segment. The
+// watermark lives only in commit records, so without the first step a
+// restart whose active segment holds none of them would forget it and
+// re-apply the Raft log from index 1.
+void finish_recovery(TransactionManager& transaction_manager,
+                     const std::string& db_file_name,
+                     std::uint64_t last_applied_raft_index);
