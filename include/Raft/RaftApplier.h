@@ -27,7 +27,6 @@ public:
                 RaftLog& raft_log,
                 KeyStore& key_store,
                 TransactionManager& transaction_manager,
-                Log& wal,
                 std::size_t max_apply_batch_size = DEFAULT_MAX_APPLY_BATCH_SIZE);
 
     RaftApplier(const RaftApplier&) = delete;
@@ -53,6 +52,5 @@ private:
     RaftLog& raft_log_;
     KeyStore& key_store_;
     TransactionManager& transaction_manager_;
-    Log& wal_;
     std::size_t max_apply_batch_size_;
 };

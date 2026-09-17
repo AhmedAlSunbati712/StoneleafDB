@@ -18,13 +18,11 @@ RaftApplier::RaftApplier(RaftState& state,
                          RaftLog& raft_log,
                          KeyStore& key_store,
                          TransactionManager& transaction_manager,
-                         Log& wal,
                          std::size_t max_apply_batch_size)
     : state_(state),
       raft_log_(raft_log),
       key_store_(key_store),
       transaction_manager_(transaction_manager),
-      wal_(wal),
       max_apply_batch_size_(std::max<std::size_t>(max_apply_batch_size, 1)) {}
 
 void RaftApplier::run() {

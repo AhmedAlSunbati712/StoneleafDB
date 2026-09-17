@@ -100,7 +100,7 @@ protected:
             state.set_commit_index(raft_log.last_index());
         }
 
-        RaftApplier applier(state, raft_log, store, transaction_manager, wal);
+        RaftApplier applier(state, raft_log, store, transaction_manager);
         std::size_t applied = 0;
         while (std::size_t batch = applier.apply_pending_batch()) applied += batch;
         EXPECT_EQ(applied, entries.size());
@@ -279,7 +279,7 @@ TEST_F(RecoveryWatermarkTest, AnUnsyncedApplyTailLostInACrashIsReappliedFromTheR
                 {.raft = PEER_RAFT, .database_server = PEER_CLIENT},
             },
             SELF_CLIENT, hard_state, 0);
-        RaftApplier applier(state, raft_log, store, transaction_manager, wal);
+        RaftApplier applier(state, raft_log, store, transaction_manager);
 
         for (std::uint64_t id = 1; id <= 10; ++id) raft_log.append(1, {put_op(id, "a")});
         raft_log.sync_through(10);
@@ -339,7 +339,7 @@ TEST_F(RecoveryWatermarkTest, AnUnsyncedApplyTailLostInACrashIsReappliedFromTheR
         std::lock_guard lock(state.state_mutex);
         state.set_commit_index(10);
     }
-    RaftApplier applier(state, raft_log, store, transaction_manager, wal);
+    RaftApplier applier(state, raft_log, store, transaction_manager);
     while (applier.apply_pending_batch() > 0) {}
 
     for (std::uint64_t id = 1; id <= 10; ++id) {

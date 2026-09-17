@@ -370,7 +370,7 @@ protected:
             self_client, *hard_state, 0);
 
         applier = std::make_unique<RaftApplier>(
-            *state, *raft_log, store, *transaction_manager, *wal);
+            *state, *raft_log, store, *transaction_manager);
         apply_thread = std::thread([this] { applier->run(); });
 
         {

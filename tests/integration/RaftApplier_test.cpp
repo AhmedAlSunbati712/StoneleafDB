@@ -134,7 +134,7 @@ TEST_F(RaftApplierTest, AppliesCommittedEntriesAndAdvancesWatermark) {
         {put_op(2, "two"), put_op(3, "three")},
     });
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     EXPECT_EQ(applier.apply_pending_batch(), 2u);
 
     EXPECT_EQ(last_applied(), 2u);
@@ -144,7 +144,7 @@ TEST_F(RaftApplierTest, AppliesCommittedEntriesAndAdvancesWatermark) {
 }
 
 TEST_F(RaftApplierTest, AppliesNothingWhenCaughtUp) {
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
 
     EXPECT_EQ(applier.apply_pending_batch(), 0u);
     EXPECT_EQ(last_applied(), 0u);
@@ -156,7 +156,7 @@ TEST_F(RaftApplierTest, DeleteInALaterEntryRemovesAnEarlierPut) {
         {delete_op(1)},
     });
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     EXPECT_EQ(applier.apply_pending_batch(), 2u);
 
     EXPECT_EQ(last_applied(), 2u);
@@ -166,7 +166,7 @@ TEST_F(RaftApplierTest, DeleteInALaterEntryRemovesAnEarlierPut) {
 TEST_F(RaftApplierTest, DeleteOfAnAbsentKeyStillApplies) {
     append_and_commit({{delete_op(42)}});
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     EXPECT_EQ(applier.apply_pending_batch(), 1u);
 
     EXPECT_EQ(last_applied(), 1u);
@@ -182,7 +182,7 @@ TEST_F(RaftApplierTest, BacklogIsAppliedAcrossSeveralBatches) {
         {put_op(5, "five")},
     });
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal, 2);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager, 2);
     EXPECT_EQ(applier.apply_pending_batch(), 2u);
     EXPECT_EQ(last_applied(), 2u);
     EXPECT_EQ(applier.apply_pending_batch(), 2u);
@@ -204,7 +204,7 @@ TEST_F(RaftApplierTest, AppliesEnoughDistinctKeysToSplitLeaves) {
     }
     append_and_commit(entries);
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     std::size_t applied = 0;
     while (std::size_t batch = applier.apply_pending_batch()) applied += batch;
 
@@ -222,7 +222,7 @@ TEST_F(RaftApplierTest, ApplyingDoesNotSyncTheWal) {
     append_and_commit({{put_op(1, "a")}, {put_op(2, "b")}});
     const Lsn durable_before = wal->durable_lsn();
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     EXPECT_EQ(applier.apply_pending_batch(), 2u);
 
     EXPECT_EQ(last_applied(), 2u);
@@ -238,7 +238,7 @@ TEST_F(RaftApplierTest, AppliesAKeyAnotherTransactionHoldsExclusively) {
 
     append_and_commit({{put_op(1, "from-raft")}});
 
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     EXPECT_EQ(applier.apply_pending_batch(), 1u);
     EXPECT_EQ(last_applied(), 1u);
 
@@ -247,7 +247,7 @@ TEST_F(RaftApplierTest, AppliesAKeyAnotherTransactionHoldsExclusively) {
 }
 
 TEST_F(RaftApplierTest, RunAppliesOnNotifyAndStopsOnShutdown) {
-    RaftApplier applier(*state, *raft_log, store, *transaction_manager, *wal);
+    RaftApplier applier(*state, *raft_log, store, *transaction_manager);
     std::thread worker([&applier] { applier.run(); });
 
     append_and_commit({{put_op(1, "one")}, {put_op(2, "two")}});

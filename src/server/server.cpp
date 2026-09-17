@@ -269,7 +269,7 @@ int main(int argc, char *argv[]) {
     }
 
     // 4. The apply loop, on every server regardless of role.
-    RaftApplier applier(*raft_state, raft_log, key_store, transaction_manager, log);
+    RaftApplier applier(*raft_state, raft_log, key_store, transaction_manager);
     std::thread apply_thread([&applier] {
         try {
             applier.run();
