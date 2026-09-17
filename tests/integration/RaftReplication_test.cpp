@@ -248,6 +248,65 @@ TEST_F(ReplicationTest, ReplicationContinuesAcrossASegmentRollover) {
     EXPECT_EQ(commit_index_of(0), entry_count);
 }
 
+TEST_F(ReplicationTest, AHeartbeatRoundConfirmsTheLeadersReadRound) {
+    build(3);
+    make_leader();
+
+    std::uint64_t round = 0;
+    {
+        std::lock_guard lock(nodes[0]->state->state_mutex);
+        round = nodes[0]->state->start_read_round();
+        EXPECT_EQ(nodes[0]->state->confirmed_read_round(), 0u);
+    }
+
+    // An empty AppendEntries is all a confirmation needs: leader + one peer is
+    // a majority of three.
+    EXPECT_TRUE(replicators[0]->replicate_once());
+
+    std::lock_guard lock(nodes[0]->state->state_mutex);
+    EXPECT_EQ(nodes[0]->state->acked_read_round(raft_addresses[1]), round);
+    EXPECT_EQ(nodes[0]->state->confirmed_read_round(), round);
+}
+
+TEST_F(ReplicationTest, AFailedConsistencyCheckStillConfirmsTheRound) {
+    // The follower rejected the entry but answered in our term, which is what
+    // leadership confirmation asks. Refusing to count it would stall reads
+    // whenever a follower is catching up.
+    build(3);
+    nodes[0]->log->append(1, {put_op(1, "a")});
+    nodes[0]->log->append(1, {put_op(2, "b")});
+    make_leader();   // send_next starts past the follower's log, so the first RPC fails
+
+    std::uint64_t round = 0;
+    {
+        std::lock_guard lock(nodes[0]->state->state_mutex);
+        round = nodes[0]->state->start_read_round();
+    }
+    EXPECT_FALSE(replicators[0]->replicate_once());
+
+    std::lock_guard lock(nodes[0]->state->state_mutex);
+    EXPECT_EQ(nodes[0]->state->confirmed_read_round(), round);
+}
+
+TEST_F(ReplicationTest, AnUnreachableMajorityLeavesTheRoundUnconfirmed) {
+    build(3);
+    make_leader();
+    nodes[1]->stop();
+    nodes[2]->stop();
+
+    std::uint64_t round = 0;
+    {
+        std::lock_guard lock(nodes[0]->state->state_mutex);
+        round = nodes[0]->state->start_read_round();
+    }
+    EXPECT_FALSE(replicators[0]->replicate_once());
+    EXPECT_FALSE(replicators[1]->replicate_once());
+
+    std::lock_guard lock(nodes[0]->state->state_mutex);
+    EXPECT_EQ(nodes[0]->state->confirmed_read_round(), 0u)
+        << "a partitioned leader must not confirm a read round";
+}
+
 TEST_F(ReplicationTest, ReplicationDoesNotWaitForAnInFlightAppend) {
     // A leader's append runs under append_mutex, not state_mutex. Heartbeats
     // and replication must keep going while one is in progress - on a shared
