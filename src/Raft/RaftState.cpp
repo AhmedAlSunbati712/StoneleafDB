@@ -102,6 +102,7 @@ void RaftState::become_leader(std::uint64_t last_log_index) {
     // the no-op index belongs to the leadership that appended it.
     acked_read_round_.clear();
     confirmed_read_round_ = 0;
+    read_round_wanted_ = false;
     leader_term_first_index_ = 0;
     for (const NodeAddress& peer : peers_) {
         send_next_.emplace(peer, last_log_index + 1);

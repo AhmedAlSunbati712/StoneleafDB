@@ -38,9 +38,18 @@ void RaftReplicator::run() {
             if (state_.shutting_down) return;
 
             // Leading. Wait for something to send, but wake for the heartbeat
-            // regardless: silence is what makes a follower campaign.
-            if (state_.send_next(peer_) > raft_log_.last_index()) {
-                state_.replication_cv.wait_for(lock, RaftState::HEARTBEAT_INTERVAL);
+            // regardless: silence is what makes a follower campaign. A read
+            // waiting on leadership confirmation is also something to send -
+            // without it the read would wait out the heartbeat interval.
+            if (state_.send_next(peer_) > raft_log_.last_index() &&
+                !state_.read_round_wanted()) {
+                state_.replication_cv.wait_for(
+                    lock, RaftState::HEARTBEAT_INTERVAL, [this] {
+                        return state_.shutting_down ||
+                               state_.state() != State::Leader ||
+                               state_.read_round_wanted() ||
+                               state_.send_next(peer_) <= raft_log_.last_index();
+                    });
                 if (state_.shutting_down) return;
                 if (state_.state() != State::Leader) continue;
             }
@@ -66,9 +75,10 @@ bool RaftReplicator::replicate_once() {
         sent_term = state_.current_term();
         self = state_.self_raft_address();
         leader_commit = state_.commit_index();
-        // Read by the round the reply will be credited to, not at reply time: a
-        // round that opens while this RPC is in flight is not confirmed by it.
-        sent_read_round = state_.read_round();
+        // Opens the round a reader asked for, if any, and carries it. Read
+        // here rather than at reply time: a round opened while this RPC is in
+        // flight is not confirmed by it.
+        sent_read_round = state_.open_read_round();
 
         // send_next and replicated_index are only populated for the current
         // leadership, which the state check above guarantees we hold.

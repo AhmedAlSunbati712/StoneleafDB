@@ -153,14 +153,38 @@ class RaftState {
         std::uint64_t confirmed_read_round() const noexcept { return confirmed_read_round_; }
         std::uint64_t acked_read_round(const NodeAddress& peer) const { return acked_read_round_.at(peer); }
 
-        // Opens the next round and returns its number. The caller notifies
-        // replication_cv so the replication threads heartbeat immediately
-        // rather than at the next HEARTBEAT_INTERVAL.
-        std::uint64_t start_read_round() noexcept {
-            ++read_round_;
+        // The round a read arriving now must wait for: rounds are opened by
+        // the replication threads, not by readers, so every read that arrives
+        // before the next heartbeat wave shares one round and one set of
+        // replies. A reader asks for a round and waits for this number.
+        std::uint64_t next_read_round() const noexcept { return read_round_ + 1; }
+
+        // Asks the replication threads to open a round. They call
+        // open_read_round() when they build their next request; the caller
+        // notifies replication_cv so that happens now rather than at the next
+        // HEARTBEAT_INTERVAL.
+        void request_read_round() noexcept {
+            read_round_wanted_ = true;
             // A single-node cluster has no peer to ask: the leader alone is the
-            // majority, so the round is confirmed the moment it opens.
-            if (cluster_size_ == 1) confirmed_read_round_ = read_round_;
+            // majority, so the round opens and confirms immediately.
+            if (cluster_size_ == 1) {
+                ++read_round_;
+                confirmed_read_round_ = read_round_;
+                read_round_wanted_ = false;
+                read_cv.notify_all();
+            }
+        }
+        bool read_round_wanted() const noexcept { return read_round_wanted_; }
+
+        // Called by a replication thread as it builds a request: opens the
+        // requested round, if one was requested, and returns the round this
+        // request should carry. The first thread to call it opens the round;
+        // the others carry the same number, so their replies credit it too.
+        std::uint64_t open_read_round() noexcept {
+            if (read_round_wanted_) {
+                ++read_round_;
+                read_round_wanted_ = false;
+            }
             return read_round_;
         }
 
@@ -312,6 +336,7 @@ class RaftState {
         // Leader-only, per leadership: read-index confirmation rounds.
         std::unordered_map<NodeAddress, std::uint64_t> acked_read_round_;
         std::uint64_t read_round_ = 0;
+        bool read_round_wanted_ = false;
         std::uint64_t confirmed_read_round_ = 0;
         std::uint64_t leader_term_first_index_ = 0;
 

@@ -34,9 +34,11 @@ ReadIndexStatus RaftReadIndex::wait_until_readable() {
     // anything committed before the read arrived is at or below it.
     const std::uint64_t read_index = state_.commit_index();
 
-    // 2. A round that opens now can only be confirmed by replies that arrive
-    //    after it, which is what makes the confirmation mean "still leader".
-    const std::uint64_t round = state_.start_read_round();
+    // 2. The next round to be opened can only be confirmed by replies that
+    //    arrive after it, which is what makes confirmation mean "still
+    //    leader". Every read arriving before that round opens shares it.
+    const std::uint64_t round = state_.next_read_round();
+    state_.request_read_round();
     state_.replication_cv.notify_all();   // heartbeat now, not at the next interval
     while (state_.confirmed_read_round() < round) {
         if (!leading()) return ReadIndexStatus::NotLeader;
