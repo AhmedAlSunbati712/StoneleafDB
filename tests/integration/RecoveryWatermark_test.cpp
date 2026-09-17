@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -24,6 +25,21 @@ namespace {
 
 Config recovery_wal_config() {
     return {.max_index_bytes = 1000 * Index::ENTRY_SIZE, .max_store_bytes = 16 * 1024 * 1024, .initial_lsn = 1};
+}
+
+// As server.cpp's setup_config: once cleanup has run, the log no longer
+// starts at LSN 1, so reopen it at its smallest surviving segment.
+Config reopened_wal_config(const std::string& db_file) {
+    Config config = recovery_wal_config();
+    const std::string wal_directory = db_file + ".wal";
+    if (!std::filesystem::exists(wal_directory)) return config;
+    std::optional<std::uint64_t> smallest_base;
+    for (const auto& entry : std::filesystem::directory_iterator(wal_directory)) {
+        const auto [base, is_store] = parse_wal_segment_name(entry.path().filename().string());
+        if (is_store && (!smallest_base || base < *smallest_base)) smallest_base = base;
+    }
+    config.initial_lsn = smallest_base.value_or(1);
+    return config;
 }
 
 MutationOp put_op(std::uint64_t id, const std::string& text) {
@@ -85,7 +101,9 @@ protected:
         }
 
         RaftApplier applier(state, raft_log, store, transaction_manager, wal);
-        EXPECT_EQ(applier.apply_pending_batch(), entries.size());
+        std::size_t applied = 0;
+        while (std::size_t batch = applier.apply_pending_batch()) applied += batch;
+        EXPECT_EQ(applied, entries.size());
 
         if (leave_one_uncommitted) {
             // A transaction that wrote but never committed: ARIES rolls it back,
@@ -108,12 +126,31 @@ protected:
 
     // Runs analysis + redo over the WAL left on disk and returns the watermark.
     std::uint64_t recovered_watermark() {
-        Log wal(recovery_wal_config());
+        Log wal(reopened_wal_config(db_file));
         wal.open(db_file + ".wal");
         std::unordered_map<TransactionId, Lsn> unresolved;
         std::uint64_t last_applied = 0;
         aries_recovery_redo(wal, db_file, unresolved, last_applied);
         return last_applied;
+    }
+
+    // One startup as server.cpp performs it: redo, undo through the live
+    // KeyStore, then persist the watermark and delete finalized segments.
+    void restart_like_server() {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(reopened_wal_config(db_file));
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        wal.open(db_file + ".wal");
+
+        std::unordered_map<TransactionId, Lsn> unresolved;
+        std::uint64_t last_applied = 0;
+        aries_recovery_redo(wal, db_file, unresolved, last_applied);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        aries_recovery_undo(wal, store, unresolved);
+        finish_recovery(transaction_manager, db_file, last_applied);
+        ASSERT_EQ(store.close(), KeyStoreStatus::Success);
     }
 
     std::filesystem::path temp_dir;
@@ -159,6 +196,32 @@ TEST_F(RecoveryWatermarkTest, ClientTransactionsDoNotMoveTheWatermark) {
     }
 
     EXPECT_EQ(recovered_watermark(), 1u);
+}
+
+TEST_F(RecoveryWatermarkTest, SurvivesCleanupOfEverySegmentThatCarriedIt) {
+    // Client transactions write WAL records but carry no Raft index. Enough of
+    // them after the applied entries leave the newest segment - the only one
+    // cleanup keeps - with no commit record that knows the watermark.
+    apply_entries({{put_op(1, "a")}, {put_op(2, "b")}, {put_op(3, "c")}});
+    {
+        KeyStore store;
+        LockManager lock_manager;
+        Log wal(reopened_wal_config(db_file));
+        wal.open(db_file + ".wal");
+        TransactionManager transaction_manager(wal, lock_manager, store);
+        store.attach_transaction_manager(transaction_manager);
+        ASSERT_EQ(store.open(db_file), KeyStoreStatus::Success);
+        for (int i = 0; i < 1500; ++i) {
+            TransactionHandle client = transaction_manager.begin();
+            ASSERT_EQ(transaction_manager.commit(client, Durability::Defer), CommitStatus::Success);
+        }
+        ASSERT_EQ(store.close(), KeyStoreStatus::Success);
+    }
+
+    restart_like_server();
+    EXPECT_EQ(recovered_watermark(), 3u);
+    restart_like_server();
+    EXPECT_EQ(recovered_watermark(), 3u);
 }
 
 } // namespace
