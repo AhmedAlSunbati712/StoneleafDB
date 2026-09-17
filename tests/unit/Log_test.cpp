@@ -78,6 +78,25 @@ TEST(LogTest, SyncThroughMakesEverythingAppendedDurableAcrossSegments) {
     EXPECT_THROW(log.sync_through(3), std::out_of_range);
 }
 
+TEST(LogTest, SyncedRecordsSurviveLosingEveryUnsyncedIndexBlock) {
+    // sync_through makes the Store durable, not the Index. Model the worst a
+    // crash can do to the Index - every block read back as zeros - and check
+    // reopening rebuilds it and loses no synced record.
+    TempDir dir; Log log(config()); log.open(dir.path.string());
+    for (char c = 'a'; c < 'a' + 20; ++c) log.append(system({c}));
+    log.sync_through(20);
+    const auto index_path = dir.path / "segment-00000000000000000001.index";
+    const auto index_size = std::filesystem::file_size(index_path);
+    // Abandon without close(), which would sync the Index too.
+    { std::ofstream zeroed(index_path, std::ios::binary | std::ios::trunc);
+      zeroed.write(std::string(index_size, '\0').data(), static_cast<std::streamsize>(index_size)); }
+
+    Log reopened(config()); reopened.open(dir.path.string());
+    ASSERT_EQ(reopened.next_lsn(), 21u);
+    EXPECT_EQ(reopened.read(1).data, std::vector<char>{'a'});
+    EXPECT_EQ(reopened.read(20).data, std::vector<char>{static_cast<char>('a' + 19)});
+}
+
 TEST(LogTest, ConcurrentSyncsEachReturnOnlyOnceTheirRecordIsDurable) {
     // Group commit: one thread fsyncs while the rest wait and then find their
     // record covered. None may return before its own LSN is durable.
