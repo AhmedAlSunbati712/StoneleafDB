@@ -215,6 +215,73 @@ TEST(RaftStateTest, BecomeLeaderRebuildsProgressAndRecordsSelfAsLeader) {
     EXPECT_EQ(state.replicated_index(PEER_C_RAFT), 0u);
 }
 
+TEST(RaftStateTest, ReadRoundConfirmsOnceAMajorityOfPeersHasAcked) {
+    TempDir dir;
+    RaftHardStateStore store;
+    store.open(dir.path.string());
+    RaftState state(three_node_cluster(), SELF_CLIENT, store, 0);
+
+    std::lock_guard lock(state.state_mutex);
+    state.become_candidate();
+    state.become_leader(10);
+    EXPECT_EQ(state.read_round(), 0u);
+    EXPECT_EQ(state.confirmed_read_round(), 0u);
+
+    const std::uint64_t round = state.start_read_round();
+    EXPECT_EQ(round, 1u);
+    EXPECT_EQ(state.confirmed_read_round(), 0u);
+
+    // Three nodes: the leader plus one peer is a majority.
+    state.record_read_ack(PEER_B_RAFT, round);
+    EXPECT_EQ(state.confirmed_read_round(), round);
+
+    // A stale ack never moves confirmation backwards.
+    const std::uint64_t next = state.start_read_round();
+    state.record_read_ack(PEER_C_RAFT, round);
+    EXPECT_EQ(state.confirmed_read_round(), round);
+    state.record_read_ack(PEER_C_RAFT, next);
+    EXPECT_EQ(state.confirmed_read_round(), next);
+}
+
+TEST(RaftStateTest, ReadRoundNeedsTwoPeerAcksInAFiveNodeCluster) {
+    TempDir dir;
+    RaftHardStateStore store;
+    store.open(dir.path.string());
+    RaftState state(five_node_cluster(), SELF_CLIENT, store, 0);
+
+    std::lock_guard lock(state.state_mutex);
+    state.become_candidate();
+    state.become_leader(1);
+    const std::uint64_t round = state.start_read_round();
+
+    state.record_read_ack(PEER_B_RAFT, round);
+    EXPECT_EQ(state.confirmed_read_round(), 0u) << "leader + 1 of 5 is not a majority";
+    state.record_read_ack(PEER_C_RAFT, round);
+    EXPECT_EQ(state.confirmed_read_round(), round);
+}
+
+TEST(RaftStateTest, BecomeLeaderDropsReadAcksFromAnEarlierLeadership) {
+    TempDir dir;
+    RaftHardStateStore store;
+    store.open(dir.path.string());
+    RaftState state(three_node_cluster(), SELF_CLIENT, store, 0);
+
+    std::lock_guard lock(state.state_mutex);
+    state.become_candidate();
+    state.become_leader(1);
+    const std::uint64_t round = state.start_read_round();
+    state.record_read_ack(PEER_B_RAFT, round);
+    ASSERT_EQ(state.confirmed_read_round(), round);
+
+    // A later leadership cannot inherit a peer's acknowledgement: it proved
+    // that peer recognized the earlier term, which says nothing about now.
+    state.become_candidate();
+    state.become_leader(1);
+    EXPECT_EQ(state.confirmed_read_round(), 0u);
+    EXPECT_EQ(state.acked_read_round(PEER_B_RAFT), 0u);
+    EXPECT_EQ(state.leader_term_first_index(), 0u);
+}
+
 TEST(RaftStateTest, BecomeFollowerTracksCurrentLeaderAndPreservesSameTermVote) {
     TempDir dir;
     RaftHardStateStore store;
