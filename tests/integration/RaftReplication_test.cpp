@@ -257,7 +257,8 @@ TEST_F(ReplicationTest, AHeartbeatRoundConfirmsTheLeadersReadRound) {
     std::uint64_t round = 0;
     {
         std::lock_guard lock(nodes[0]->state->state_mutex);
-        round = nodes[0]->state->start_read_round();
+        round = nodes[0]->state->next_read_round();
+        nodes[0]->state->request_read_round();
         EXPECT_EQ(nodes[0]->state->confirmed_read_round(), 0u);
     }
 
@@ -282,7 +283,8 @@ TEST_F(ReplicationTest, AFailedConsistencyCheckStillConfirmsTheRound) {
     std::uint64_t round = 0;
     {
         std::lock_guard lock(nodes[0]->state->state_mutex);
-        round = nodes[0]->state->start_read_round();
+        round = nodes[0]->state->next_read_round();
+        nodes[0]->state->request_read_round();
     }
     EXPECT_FALSE(replicators[0]->replicate_once());
 
@@ -299,7 +301,8 @@ TEST_F(ReplicationTest, AnUnreachableMajorityLeavesTheRoundUnconfirmed) {
     std::uint64_t round = 0;
     {
         std::lock_guard lock(nodes[0]->state->state_mutex);
-        round = nodes[0]->state->start_read_round();
+        round = nodes[0]->state->next_read_round();
+        nodes[0]->state->request_read_round();
     }
     EXPECT_FALSE(replicators[0]->replicate_once());
     EXPECT_FALSE(replicators[1]->replicate_once());

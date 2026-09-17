@@ -227,7 +227,11 @@ TEST(RaftStateTest, ReadRoundConfirmsOnceAMajorityOfPeersHasAcked) {
     EXPECT_EQ(state.read_round(), 0u);
     EXPECT_EQ(state.confirmed_read_round(), 0u);
 
-    const std::uint64_t round = state.start_read_round();
+    const std::uint64_t round = state.next_read_round();
+    state.request_read_round();
+    EXPECT_TRUE(state.read_round_wanted());
+    EXPECT_EQ(state.open_read_round(), round);
+    EXPECT_FALSE(state.read_round_wanted()) << "one round serves every waiting read";
     EXPECT_EQ(round, 1u);
     EXPECT_EQ(state.confirmed_read_round(), 0u);
 
@@ -236,11 +240,29 @@ TEST(RaftStateTest, ReadRoundConfirmsOnceAMajorityOfPeersHasAcked) {
     EXPECT_EQ(state.confirmed_read_round(), round);
 
     // A stale ack never moves confirmation backwards.
-    const std::uint64_t next = state.start_read_round();
+    state.request_read_round();
+    const std::uint64_t next = state.open_read_round();
     state.record_read_ack(PEER_C_RAFT, round);
     EXPECT_EQ(state.confirmed_read_round(), round);
     state.record_read_ack(PEER_C_RAFT, next);
     EXPECT_EQ(state.confirmed_read_round(), next);
+}
+
+TEST(RaftStateTest, ASingleNodeLeaderConfirmsItsOwnReadRound) {
+    TempDir dir;
+    RaftHardStateStore store;
+    store.open(dir.path.string());
+    RaftState state(std::vector<ClusterMember>{{.raft = SELF_RAFT, .database_server = SELF_CLIENT}},
+                    SELF_CLIENT, store, 0);
+
+    std::lock_guard lock(state.state_mutex);
+    state.become_candidate();
+    state.become_leader(0);
+    // No peer exists to acknowledge, and no replication thread to open it.
+    const std::uint64_t round = state.next_read_round();
+    state.request_read_round();
+    EXPECT_EQ(state.confirmed_read_round(), round);
+    EXPECT_FALSE(state.read_round_wanted());
 }
 
 TEST(RaftStateTest, ReadRoundNeedsTwoPeerAcksInAFiveNodeCluster) {
@@ -252,7 +274,8 @@ TEST(RaftStateTest, ReadRoundNeedsTwoPeerAcksInAFiveNodeCluster) {
     std::lock_guard lock(state.state_mutex);
     state.become_candidate();
     state.become_leader(1);
-    const std::uint64_t round = state.start_read_round();
+    state.request_read_round();
+    const std::uint64_t round = state.open_read_round();
 
     state.record_read_ack(PEER_B_RAFT, round);
     EXPECT_EQ(state.confirmed_read_round(), 0u) << "leader + 1 of 5 is not a majority";
@@ -269,7 +292,8 @@ TEST(RaftStateTest, BecomeLeaderDropsReadAcksFromAnEarlierLeadership) {
     std::lock_guard lock(state.state_mutex);
     state.become_candidate();
     state.become_leader(1);
-    const std::uint64_t round = state.start_read_round();
+    state.request_read_round();
+    const std::uint64_t round = state.open_read_round();
     state.record_read_ack(PEER_B_RAFT, round);
     ASSERT_EQ(state.confirmed_read_round(), round);
 

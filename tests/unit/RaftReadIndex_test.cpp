@@ -76,13 +76,14 @@ TEST(RaftReadIndexTest, ReadsWaitForAPeerToConfirmTheRound) {
     fixture.lead_and_settle();
     RaftReadIndex read_index(*fixture.state);
 
-    // Stands in for the replication thread: acknowledges whatever round is open.
+    // Stands in for the replication thread: opens the requested round, as it
+    // would when building its next AppendEntries, then credits the reply.
     std::thread peer([&] {
         for (int attempt = 0; attempt < 200; ++attempt) {
             {
                 std::lock_guard lock(fixture.state->state_mutex);
-                const std::uint64_t round = fixture.state->read_round();
-                if (round > fixture.state->confirmed_read_round()) {
+                if (fixture.state->read_round_wanted()) {
+                    const std::uint64_t round = fixture.state->open_read_round();
                     fixture.state->record_read_ack(PEER_B_RAFT, round);
                     return;
                 }
