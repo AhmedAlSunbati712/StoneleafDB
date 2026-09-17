@@ -401,21 +401,25 @@ written to them. Recovery handles missing writes, incomplete append tails, and
 Store/Index persistence gaps; arbitrary damage inside complete bytes is outside
 scope and fails open rather than being repaired.
 
-Segment open repairs only crash-explained suffix differences:
+Only the Store is synced at a durability boundary. `Log::sync_through` and
+`RaftLog::sync_through` call `sync_store()`; the Index is synced only by
+`close()` and by recovery. So after a crash the Index can be arbitrarily stale:
+short, with blocks that were never written reading back as zeros, or with
+entries pointing at the wrong frame. Segment open therefore trusts none of it
+until it agrees with the Store:
 
 1. Truncate an incomplete Store frame to the last complete boundary.
-2. Reject a structurally complete Index entry whose relative LSN is corrupt.
-3. Retain the smaller of the complete Store and Index counts.
-4. Use the last retained Index entry to locate the Store suffix, or Store offset
-   zero when no Index entries survived.
-5. Truncate a partial or extra Index suffix and append mappings only for Store
-   records missing from the Index.
+2. Walk the whole Store, recording each frame's offset and checking the dense
+   absolute-LSN (or Raft index) sequence.
+3. Retain the longest Index prefix whose entries have the right ordinal and
+   point at the right frame. A zero-filled block fails the ordinal check.
+4. Truncate everything after that prefix and append mappings for every
+   remaining Store record.
 
 Recovery synchronizes a changed authoritative Store before the repaired Index.
-Normal `sync()` uses the same Store-before-Index order. This tail-oriented rule
-avoids rescanning and rewriting the whole Index after an incomplete Index
-append. It does not walk backward through complete entries looking for a
-repairable boundary.
+Walking the whole Store costs a read of every record in the segment on open,
+which recovery's redo pass reads anyway; in exchange no Index state a crash can
+produce stops the log from opening.
 
 The minimal record codec catches short records, reserved LSN zero, and a
 non-dense absolute-LSN sequence. It does not yet protect opaque data with a
