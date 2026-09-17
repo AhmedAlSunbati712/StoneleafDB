@@ -66,6 +66,31 @@ TEST(RaftLogTest, AppendsValidatedLeaderBatchAndScansFromIndex) {
     EXPECT_EQ(log.last_index(), 3u);
 }
 
+TEST(RaftLogTest, ReadRangeReturnsAtMostMaxCountEntriesAcrossSegments) {
+    // max_index_bytes = 120 fits few entries per segment, so a range of ten
+    // crosses several segments.
+    TempDir dir;
+    RaftLog log(config());
+    log.open(dir.path.string());
+    for (std::uint64_t i = 1; i <= 30; ++i) log.append(i, {});
+
+    const auto window = log.read_range(5, 10);
+    ASSERT_EQ(window.size(), 10u);
+    for (std::size_t k = 0; k < window.size(); ++k) {
+        EXPECT_EQ(window[k].idx, 5 + k);
+        EXPECT_EQ(window[k].term, 5 + k);
+    }
+
+    const auto tail = log.read_range(25, 100);
+    ASSERT_EQ(tail.size(), 6u);
+    EXPECT_EQ(tail.back().idx, 30u);
+
+    EXPECT_TRUE(log.read_range(31, 10).empty());
+    EXPECT_TRUE(log.read_range(1, 0).empty());
+    EXPECT_THROW(log.read_range(0, 1), std::out_of_range);
+    EXPECT_THROW(log.read_range(32, 1), std::out_of_range);
+}
+
 TEST(RaftLogTest, TruncatesWithinSegmentAndPersistsReplacement) {
     TempDir dir;
     {
