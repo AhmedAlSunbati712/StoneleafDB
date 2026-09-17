@@ -82,8 +82,11 @@ grpc::Status RaftServiceImpl::AppendEntries(grpc::ServerContext* context, const 
     // decision and the log write would let a concurrent AppendEntries from
     // another term interleave its truncation with ours, and the consistency
     // check would no longer mean anything by the time we acted on it.
-    // Lock order is state_mutex -> raft log mutex, which is why state is taken
-    // first even though the consistency check only reads the log.
+    // Lock order is append_mutex -> state_mutex -> raft log mutex, which is why
+    // state is taken before the consistency check even though it only reads
+    // the log. append_mutex keeps a local proposal's append from landing
+    // between our consistency check and our truncate-and-append.
+    std::lock_guard append_lock(state_.append_mutex);
     std::lock_guard lock(state_.state_mutex);
 
     // With byte-identical configs this cannot fail; if it does, two nodes

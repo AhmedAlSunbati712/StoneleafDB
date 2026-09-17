@@ -13,20 +13,24 @@ ProposeStatus RaftProposer::propose(std::vector<MutationOp> operations) {
     std::uint64_t my_term = 0;
 
     {
-        std::lock_guard lock(state_.state_mutex);
+        std::lock_guard append_lock(state_.append_mutex);
+        {
+            std::lock_guard lock(state_.state_mutex);
 
-        // Leadership can change mid-session: a transaction may open while we
-        // lead, buffer writes for seconds, and reach COMMIT after we have been
-        // deposed. The fast path at accept time is not the correctness-critical
-        // check - this one is.
-        if (state_.state() != State::Leader) return ProposeStatus::NotLeader;
+            // Leadership can change mid-session: a transaction may open while
+            // we lead, buffer writes for seconds, and reach COMMIT after we
+            // have been deposed. The fast path at accept time is not the
+            // correctness-critical check - this one is.
+            if (state_.state() != State::Leader) return ProposeStatus::NotLeader;
+            my_term = state_.current_term();
+        }
 
-        my_term = state_.current_term();
-        // Atomic with the check above, under this single hold.
+        // Appended under append_mutex only, so the write never holds
+        // state_mutex. Losing leadership since the check above is safe; see
+        // RaftState::append_mutex.
         index = raft_log_.append(my_term, std::move(operations));
-
-        state_.replication_cv.notify_all();
     }
+    state_.replication_cv.notify_all();
 
     // Durable before our copy can count toward a majority, and deliberately
     // outside state_mutex: this is an fsync. advance_commit_index() tests

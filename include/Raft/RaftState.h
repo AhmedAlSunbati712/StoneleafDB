@@ -184,6 +184,22 @@ class RaftState {
         // std::mutex.
         mutable std::mutex state_mutex;
 
+        // Serializes writers of the Raft log's tail: the propose path's
+        // append, and the AppendEntries receiver's truncate-and-append. Lock
+        // order is append_mutex -> state_mutex.
+        //
+        // It exists so the leader's append - a write, which on a shared volume
+        // can stall behind another file's full sync for milliseconds - is not
+        // done under state_mutex, which heartbeats, replication and commit
+        // advancement all need. The propose path checks leadership and reads
+        // the term under state_mutex while holding this, then appends holding
+        // only this. If leadership is lost in between, the entry carries a
+        // stale term; no newer-term entry can precede it, because only the
+        // AppendEntries receiver writes those and it waits here. A new leader
+        // either overwrites the entry or commits it with its own, and
+        // await_commit reports either outcome correctly.
+        std::mutex append_mutex;
+
         // Four condition variables rather than one, so a notification wakes
         // only the threads that can actually make progress. All share
         // state_mutex.
