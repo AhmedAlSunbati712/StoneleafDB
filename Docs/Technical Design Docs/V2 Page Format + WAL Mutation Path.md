@@ -483,6 +483,16 @@ crossing record leaves the current segment maxed. `sync_through` synchronizes
 the required segments in LSN order, always Store before its derived Index, and
 advances `durable_lsn_` through at least the requested record.
 
+`sync_through` is a group commit. One thread syncs at a time, with the `Log`
+mutex released, and it takes everything appended when it started rather than
+only its own target; a caller arriving meanwhile waits and usually finds its
+record already covered. `Store::sync` and `Index::sync` fsync without holding
+their locks either, since a sync only has to cover appends that returned before
+it began. `close()` waits for an in-flight sync, which holds raw segment
+pointers. On macOS each fsync is an `F_FULLFSYNC`, which also stalls `write()`
+calls to other files on the same volume while it runs, so the fewer threads that
+append to the WAL at all, the better appends behave under load.
+
 `Log`, `Segment`, `Store`, and `Index` remain unaware of `Key`, `Value`, page
 layout, splits, or logical undo. The common WAL envelope gains record type,
 transaction ID, `prevLSN`, framing validation, and checksum, but its payload
@@ -542,7 +552,12 @@ advanced after each successful append.
 
 ### Transaction Boundary Records
 
-`TXN_BEGIN` starts the chain and has `prevLSN = 0`. `TXN_COMMIT` records the
+`TXN_BEGIN` starts the chain and has `prevLSN = 0`. It is written lazily:
+`TransactionManager::begin()` logs nothing, and `prepare_to_log()` writes the
+begin just before the transaction's first action is built. A transaction that
+never logs an action - a read, or a replicated session's lock-only local
+transaction - writes no WAL records at all, not even a decision; one whose
+commit carries a Raft index always writes its begin and commit. `TXN_COMMIT` records the
 commit decision and becomes the transaction's durability point when WAL is
 synchronized through its end. `TXN_ABORT` records the reason rollback began;
 it does not mean rollback finished. `TXN_END` records completed cleanup,

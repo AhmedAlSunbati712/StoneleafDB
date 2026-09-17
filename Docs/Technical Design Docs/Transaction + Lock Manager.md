@@ -301,6 +301,16 @@ and terminal cleanup. `append_action()` accepts only a matching B-tree action
 whose transaction ID and `prevLSN` agree with the current transaction, then
 updates `last_lsn_` only after the append succeeds.
 
+Begin records are deferred. `begin()` registers the transaction but appends
+nothing; `prepare_to_log()` appends `TXN_BEGIN` the first time a caller is about
+to build an action, and returns the LSN that action must chain to. Commit
+writes a decision only for a transaction that logged something or carries a
+Raft index, and abort of a transaction that logged nothing writes nothing. Most
+transactions - reads, and every replicated session's lock-only transaction -
+therefore never touch the WAL. That matters beyond record count: on macOS a
+`write()` stalls while any `F_FULLFSYNC` on the volume is in flight, so every
+append a session skips is one fewer stall for the apply loop.
+
 The first `begin()` after opening a retained WAL scans its records and chooses
 one greater than the largest prior transaction ID. This prevents transaction
 identity reuse across reopen until recovery or a checkpoint introduces a

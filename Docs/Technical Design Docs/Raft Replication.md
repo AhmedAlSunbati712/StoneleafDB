@@ -490,6 +490,11 @@ class RaftLog {
 
         RaftMutationEntry              read(std::uint64_t index) const;
         std::vector<RaftMutationEntry> scan_from(std::uint64_t index) const;
+        // At most max_count entries from first_index, read through the index.
+        // The replicator uses this: scan_from() decodes every segment from
+        // index onward, and the replicator reads under state_mutex.
+        std::vector<RaftMutationEntry> read_range(std::uint64_t first_index,
+                                                  std::size_t max_count) const;
 
         std::uint64_t last_index() const noexcept;
         std::uint64_t last_term()  const noexcept;
@@ -532,6 +537,8 @@ One rule: **an entry must be durable before anything is told it exists.** Concre
 - A **leader** calls `sync_through(idx)` before its own entry counts toward the majority in `advance_commit_index()`. The leader counts itself, so its own copy has to be as durable as any follower's.
 
 Both sync **once per batch**, not per entry — an `AppendEntries` carrying twenty entries is one `fsync`, which is what makes throughput scale with load rather than collapse under it.
+
+`sync_through` is also a **group commit** across callers: one thread fsyncs at a time with the log mutex released, taking every entry appended so far, and concurrent proposers wait for it and usually find their entry covered. `truncate_suffix()` waits for an in-flight sync — the sync holds pointers to segments truncation may erase, and finishing it after a truncation would mark the replaced suffix durable.
 
 ### Persisting `current_term` and `voted_for`
 These are Raft's other durable state and they do not belong in either log — the Raft log gets truncated, the WAL is for the state machine, and these two fields are neither. They live in a small fixed-layout file in the same `<db>.raft/` directory:
